@@ -1,22 +1,5 @@
-
-import {
-  S3Client,
-  ListObjectsV2Command,
-  PutObjectCommand,
-  DeleteObjectCommand,
-  DeleteObjectsCommand,
-  GetObjectCommand,
-  ListBucketsCommand,
-  CreateBucketCommand,
-  DeleteBucketCommand,
-  CopyObjectCommand
-} from '@aws-sdk/client-s3';
-import { Upload } from "@aws-sdk/lib-storage";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import JSZip from 'jszip';
 import { S3Config, FileObject, BucketObject } from '../types';
 
-// Helper to format bytes
 export const formatBytes = (bytes: number, decimals = 2) => {
   if (!+bytes) return '0 Bytes';
   const k = 1024;
@@ -27,8 +10,8 @@ export const formatBytes = (bytes: number, decimals = 2) => {
 };
 
 export class S3Service {
-  private client: S3Client | null = null;
   private config: S3Config | null = null;
+  private useElectronProxy = typeof window !== 'undefined' && !!(window as any).electron?.s3;
 
   constructor(config?: S3Config) {
     if (config) {
@@ -36,34 +19,10 @@ export class S3Service {
     }
   }
 
-  // Normalize endpoint: ensure it has a protocol scheme
-  private normalizeEndpoint(endpoint: string): string {
-    if (!endpoint) return '';
-    if (!endpoint.startsWith('http://') && !endpoint.startsWith('https://')) {
-      return `https://${endpoint}`;
-    }
-    return endpoint;
-  }
-
   init(config: S3Config) {
     this.config = config;
-    const normalizedEndpoint = this.normalizeEndpoint(config.endpoint);
-    const region = config.region || 'us-east-1';
-    this.client = new S3Client({
-      region: region,
-      endpoint: normalizedEndpoint || undefined,
-      credentials: {
-        accessKeyId: config.accessKeyId,
-        secretAccessKey: config.secretAccessKey,
-      },
-      forcePathStyle: true,
-      tls: normalizedEndpoint?.includes('localhost') && normalizedEndpoint?.startsWith('http:') ? false : true,
-      signingRegion: region,
-      signingName: 's3',
-    });
   }
 
-  // Update config without re-instantiating client (useful for switching buckets)
   updateConfig(newConfig: Partial<S3Config>) {
     if (this.config) {
       this.config = { ...this.config, ...newConfig };
@@ -71,237 +30,126 @@ export class S3Service {
   }
 
   async listBuckets(): Promise<BucketObject[]> {
-    if (!this.client) throw new Error("S3 Client not initialized");
+    if (!this.config) throw new Error("S3 Client not initialized");
 
-    try {
-      const command = new ListBucketsCommand({});
-      const response = await this.client.send(command);
-
-      return (response.Buckets || []).map(b => ({
-        name: b.Name || 'Unknown',
-        creationDate: b.CreationDate
-      }));
-    } catch (error) {
-      console.error("Error listing buckets:", error);
-      throw error;
+    if (this.useElectronProxy) {
+      const result = await (window as any).electron.s3.listBuckets(this.config);
+      if (result.success) {
+        return result.data;
+      }
+      throw new Error(result.error || 'Unknown error');
     }
+
+    throw new Error('Electron S3 proxy not available');
   }
 
   async createBucket(bucketName: string): Promise<void> {
-    if (!this.client) throw new Error("S3 Client not initialized");
-    try {
-      const command = new CreateBucketCommand({
-        Bucket: bucketName,
-      });
-      await this.client.send(command);
-    } catch (error) {
-      console.error("Error creating bucket:", error);
-      throw error;
+    if (!this.config) throw new Error("S3 Client not initialized");
+
+    if (this.useElectronProxy) {
+      const result = await (window as any).electron.s3.createBucket(this.config, bucketName);
+      if (!result.success) {
+        throw new Error(result.error || 'Unknown error');
+      }
+      return;
     }
+
+    throw new Error('Electron S3 proxy not available');
   }
 
   async deleteBucket(bucketName: string): Promise<void> {
-    if (!this.client) throw new Error("S3 Client not initialized");
-    try {
-      const command = new DeleteBucketCommand({
-        Bucket: bucketName
-      });
-      await this.client.send(command);
-    } catch (error) {
-      console.error("Error deleting bucket:", error);
-      throw error;
+    if (!this.config) throw new Error("S3 Client not initialized");
+
+    if (this.useElectronProxy) {
+      const result = await (window as any).electron.s3.deleteBucket(this.config, bucketName);
+      if (!result.success) {
+        throw new Error(result.error || 'Unknown error');
+      }
+      return;
     }
+
+    throw new Error('Electron S3 proxy not available');
   }
 
   async listFiles(prefix: string = ''): Promise<FileObject[]> {
-    if (!this.client || !this.config) throw new Error("S3 Client not initialized");
-    if (!this.config.bucketName) throw new Error("No bucket selected");
+    if (!this.config) throw new Error("S3 Client not initialized");
 
-    try {
-      let isTruncated = true;
-      let continuationToken: string | undefined = undefined;
-      const allFiles: FileObject[] = [];
-
-      // Pagination loop to fetch all files in the current directory
-      while (isTruncated) {
-        const command: ListObjectsV2Command = new ListObjectsV2Command({
-          Bucket: this.config.bucketName,
-          Prefix: prefix,
-          Delimiter: '/',
-          ContinuationToken: continuationToken,
-        });
-
-        const response = await this.client.send(command);
-
-        // Handle folders (CommonPrefixes)
-        if (response.CommonPrefixes) {
-          response.CommonPrefixes.forEach((p) => {
-            if (p.Prefix) {
-              // Avoid duplicates if pagination returns them (rare for CommonPrefixes but good safety)
-              const exists = allFiles.some(f => f.key === p.Prefix);
-              if (!exists) {
-                allFiles.push({
-                  key: p.Prefix,
-                  name: p.Prefix.replace(prefix, '').replace('/', ''),
-                  size: 0,
-                  lastModified: new Date(),
-                  isFolder: true,
-                });
-              }
-            }
-          });
-        }
-
-        // Handle files (Contents)
-        if (response.Contents) {
-          response.Contents.forEach((c) => {
-            if (c.Key && c.Key !== prefix) { // Skip the folder object itself if it exists
-              allFiles.push({
-                key: c.Key,
-                name: c.Key.replace(prefix, ''),
-                size: c.Size || 0,
-                lastModified: c.LastModified || new Date(),
-                isFolder: false,
-                mimeType: this.getMimeType(c.Key),
-              });
-            }
-          });
-        }
-
-        isTruncated = response.IsTruncated || false;
-        continuationToken = response.NextContinuationToken;
+    if (this.useElectronProxy) {
+      const result = await (window as any).electron.s3.listFiles(this.config, prefix);
+      if (result.success) {
+        return result.data;
       }
-
-      // Sort: Folders first, then files. Alphabetical.
-      return allFiles.sort((a, b) => {
-        if (a.isFolder === b.isFolder) {
-          return a.name.localeCompare(b.name);
-        }
-        return a.isFolder ? -1 : 1;
-      });
-
-    } catch (error) {
-      console.error("Error listing files:", error);
-      throw error;
+      throw new Error(result.error || 'Unknown error');
     }
+
+    throw new Error('Electron S3 proxy not available');
   }
 
-  // Helper: Recursively list all objects with a prefix (no delimiter)
   private async listAllObjects(prefix: string): Promise<{ Key: string; Size: number }[]> {
-    if (!this.client || !this.config?.bucketName) throw new Error("Invalid state");
+    if (!this.config) throw new Error("Invalid state");
 
-    let isTruncated = true;
-    let continuationToken: string | undefined = undefined;
-    const objects: { Key: string; Size: number }[] = [];
-
-    while (isTruncated) {
-      const command: ListObjectsV2Command = new ListObjectsV2Command({
-        Bucket: this.config.bucketName,
-        Prefix: prefix,
-        ContinuationToken: continuationToken,
-      });
-
-      const response = await this.client.send(command);
-
-      if (response.Contents) {
-        response.Contents.forEach(c => {
-          if (c.Key) objects.push({ Key: c.Key, Size: c.Size || 0 });
-        });
+    if (this.useElectronProxy) {
+      const result = await (window as any).electron.s3.listAllObjects(this.config, prefix);
+      if (result.success) {
+        return result.data;
       }
-
-      isTruncated = response.IsTruncated || false;
-      continuationToken = response.NextContinuationToken;
+      throw new Error(result.error || 'Unknown error');
     }
 
-    return objects;
+    throw new Error('Electron S3 proxy not available');
   }
 
   async deleteFolder(prefix: string): Promise<void> {
-    if (!this.client || !this.config?.bucketName) throw new Error("Invalid state");
+    if (!this.config) throw new Error("Invalid state");
 
-    // 1. List all objects recursively
     const objects = await this.listAllObjects(prefix);
-
     if (objects.length === 0) return;
 
-    // 2. Delete in batches of 1000 (S3 limit)
-    const batchSize = 1000;
-    for (let i = 0; i < objects.length; i += batchSize) {
-      const batch = objects.slice(i, i + batchSize);
-      const command = new DeleteObjectsCommand({
-        Bucket: this.config.bucketName,
-        Delete: {
-          Objects: batch.map(o => ({ Key: o.Key })),
-          Quiet: true
-        }
-      });
-      await this.client.send(command);
+    if (this.useElectronProxy) {
+      const result = await (window as any).electron.s3.deleteObjects(this.config, objects.map(o => o.Key));
+      if (!result.success) {
+        throw new Error(result.error || 'Unknown error');
+      }
+      return;
     }
+
+    throw new Error('Electron S3 proxy not available');
   }
 
-  // Calculate total size of a bucket (or prefix within bucket)
   async getBucketSize(bucketName?: string, prefix: string = ''): Promise<number> {
-    if (!this.client) throw new Error("S3 Client not initialized");
+    if (!this.config) throw new Error("S3 Client not initialized");
 
-    const targetBucket = bucketName || this.config?.bucketName;
+    const targetBucket = bucketName || this.config.bucketName;
     if (!targetBucket) throw new Error("No bucket specified");
 
-    try {
-      let isTruncated = true;
-      let continuationToken: string | undefined = undefined;
-      let totalSize = 0;
-
-      while (isTruncated) {
-        const command: ListObjectsV2Command = new ListObjectsV2Command({
-          Bucket: targetBucket,
-          Prefix: prefix,
-          ContinuationToken: continuationToken,
-        });
-
-        const response = await this.client.send(command);
-
-        if (response.Contents) {
-          response.Contents.forEach(c => {
-            totalSize += c.Size || 0;
-          });
-        }
-
-        isTruncated = response.IsTruncated || false;
-        continuationToken = response.NextContinuationToken;
+    if (this.useElectronProxy) {
+      const result = await (window as any).electron.s3.listAllObjects(this.config, prefix);
+      if (result.success) {
+        return result.data.reduce((total: number, obj: { Size: number }) => total + (obj.Size || 0), 0);
       }
-
-      return totalSize;
-    } catch (error) {
-      console.error(`Error calculating bucket size for ${targetBucket}:`, error);
-      throw error;
+      throw new Error(result.error || 'Unknown error');
     }
+
+    throw new Error('Electron S3 proxy not available');
   }
 
   async downloadFolderAsZip(prefix: string): Promise<Blob> {
-    if (!this.client || !this.config?.bucketName) throw new Error("Invalid state");
+    if (!this.config) throw new Error("Invalid state");
 
-    const zip = new JSZip();
+    const JSZip = await import('jszip');
+    const zip = new JSZip.default();
     const objects = await this.listAllObjects(prefix);
 
     await Promise.all(objects.map(async (obj) => {
-      if (obj.Key.endsWith('/')) return; // Skip folder markers
+      if (obj.Key.endsWith('/')) return;
 
       try {
-        const command = new GetObjectCommand({
-          Bucket: this.config!.bucketName,
-          Key: obj.Key
-        });
-
-        const response = await this.client!.send(command);
-        if (response.Body) {
-          // transformToByteArray is available in v3 sdk browser client
-          const byteArray = await response.Body.transformToByteArray();
-
-          // Calculate relative path
+        const result = await (window as any).electron.s3.getObject(this.config!, obj.Key);
+        if (result.success && result.data) {
+          const byteArray = new Uint8Array(result.data);
           const relativePath = obj.Key.startsWith(prefix)
             ? obj.Key.substring(prefix.length)
             : obj.Key;
-
           zip.file(relativePath, byteArray);
         }
       } catch (e) {
@@ -313,61 +161,52 @@ export class S3Service {
   }
 
   async downloadFilesAsZip(files: FileObject[]): Promise<Blob> {
-    if (!this.client || !this.config?.bucketName) throw new Error("Invalid state");
-    const zip = new JSZip();
+    if (!this.config) throw new Error("Invalid state");
 
-    // Limit concurrency slightly to avoid overwhelming network/browser
-    const downloadFile = async (file: FileObject) => {
-      try {
-        const command = new GetObjectCommand({
-          Bucket: this.config!.bucketName,
-          Key: file.key
-        });
-        const response = await this.client!.send(command);
-        if (response.Body) {
-          const byteArray = await response.Body.transformToByteArray();
-          zip.file(file.name, byteArray);
-        }
-      } catch (e) {
-        console.error("Failed to zip", file.key);
-      }
-    };
+    const JSZip = await import('jszip');
+    const zip = new JSZip.default();
 
     for (const f of files) {
-      await downloadFile(f);
+      try {
+        const result = await (window as any).electron.s3.getObject(this.config!, f.key);
+        if (result.success && result.data) {
+          const byteArray = new Uint8Array(result.data);
+          zip.file(f.name, byteArray);
+        }
+      } catch (e) {
+        console.error("Failed to zip", f.key);
+      }
     }
 
     return await zip.generateAsync({ type: "blob" });
   }
 
   async getPresignedUrl(key: string, options?: { download?: boolean, expiresIn?: number }): Promise<string> {
-    if (!this.client || !this.config || !this.config.bucketName) throw new Error("S3 Client invalid");
+    if (!this.config) throw new Error("S3 Client invalid");
 
-    const commandInput: any = {
-      Bucket: this.config.bucketName,
-      Key: key,
-    };
-
-    if (options?.download) {
-      const filename = key.split('/').pop() || 'file';
-      commandInput.ResponseContentDisposition = `attachment; filename="${filename}"`;
+    if (this.useElectronProxy) {
+      const result = await (window as any).electron.s3.getPresignedUrl(this.config, key, options);
+      if (result.success) {
+        return result.data;
+      }
+      throw new Error(result.error || 'Unknown error');
     }
 
-    const command = new GetObjectCommand(commandInput);
-
-    // Default 1 hour (3600)
-    return getSignedUrl(this.client, command, { expiresIn: options?.expiresIn || 3600 });
+    throw new Error('Electron S3 proxy not available');
   }
 
   async saveFileContent(key: string, content: string, mimeType: string = 'text/plain'): Promise<void> {
-    if (!this.client || !this.config || !this.config.bucketName) throw new Error("S3 Client invalid");
-    const command = new PutObjectCommand({
-      Bucket: this.config.bucketName,
-      Key: key,
-      Body: content,
-      ContentType: mimeType
-    });
-    await this.client.send(command);
+    if (!this.config) throw new Error("S3 Client invalid");
+
+    if (this.useElectronProxy) {
+      const result = await (window as any).electron.s3.putObject(this.config, key, content, mimeType);
+      if (!result.success) {
+        throw new Error(result.error || 'Unknown error');
+      }
+      return;
+    }
+
+    throw new Error('Electron S3 proxy not available');
   }
 
   async uploadFile(
@@ -375,112 +214,79 @@ export class S3Service {
     prefix: string,
     onProgress?: (progress: number, loaded: number, total: number) => void
   ): Promise<void> {
-    if (!this.client || !this.config || !this.config.bucketName) throw new Error("S3 Client invalid");
+    if (!this.config) throw new Error("S3 Client invalid");
 
     const key = `${prefix}${file.name}`;
 
-    try {
-      const upload = new Upload({
-        client: this.client,
-        params: {
-          Bucket: this.config.bucketName,
-          Key: key,
-          Body: file,
-          ContentType: file.type,
-        },
-      });
-
-      upload.on("httpUploadProgress", (progress) => {
-        if (progress.loaded !== undefined && progress.total !== undefined && onProgress) {
-          const percentage = Math.round((progress.loaded / progress.total) * 100);
-          onProgress(percentage, progress.loaded, progress.total);
-        }
-      });
-
-      await upload.done();
-    } catch (error: any) {
-      console.error("Standard upload failed:", error);
-
-      const isMiddlewareError = error.message && (
-        error.message.includes("middleware") ||
-        error.message.includes("serializerMiddleware") ||
-        error.message.includes("is not a function")
-      );
-
-      if (isMiddlewareError) {
-        console.warn("Falling back to simple PutObjectCommand due to SDK middleware issue");
-
-        const command = new PutObjectCommand({
-          Bucket: this.config.bucketName,
-          Key: key,
-          Body: file,
-          ContentType: file.type,
-        });
-
-        await this.client.send(command);
-
-        if (onProgress) onProgress(100, file.size, file.size);
-        return;
+    if (this.useElectronProxy) {
+      const arrayBuffer = await file.arrayBuffer();
+      const result = await (window as any).electron.s3.uploadFile(this.config, key, arrayBuffer, file.type);
+      if (!result.success) {
+        throw new Error(result.error || 'Unknown error');
       }
-
-      throw error;
+      if (onProgress) onProgress(100, file.size, file.size);
+      return;
     }
+
+    throw new Error('Electron S3 proxy not available');
   }
 
   async deleteFile(key: string): Promise<void> {
-    if (!this.client || !this.config || !this.config.bucketName) throw new Error("S3 Client invalid");
+    if (!this.config) throw new Error("S3 Client invalid");
 
-    const command = new DeleteObjectCommand({
-      Bucket: this.config.bucketName,
-      Key: key,
-    });
+    if (this.useElectronProxy) {
+      const result = await (window as any).electron.s3.deleteObject(this.config, key);
+      if (!result.success) {
+        throw new Error(result.error || 'Unknown error');
+      }
+      return;
+    }
 
-    await this.client.send(command);
+    throw new Error('Electron S3 proxy not available');
   }
 
   async createFolder(folderName: string, prefix: string): Promise<void> {
-    if (!this.client || !this.config || !this.config.bucketName) throw new Error("S3 Client invalid");
+    if (!this.config) throw new Error("S3 Client invalid");
 
     const sanitizedName = folderName.replace(/^\/+|\/+$/g, '');
     const key = `${prefix}${sanitizedName}/`;
 
-    const command = new PutObjectCommand({
-      Bucket: this.config.bucketName,
-      Key: key,
-      Body: '',
-    });
+    if (this.useElectronProxy) {
+      const result = await (window as any).electron.s3.putObject(this.config, key, '', '');
+      if (!result.success) {
+        throw new Error(result.error || 'Unknown error');
+      }
+      return;
+    }
 
-    await this.client.send(command);
+    throw new Error('Electron S3 proxy not available');
   }
 
   async moveObject(sourceBucket: string, sourceKey: string, destBucket: string, destKey: string): Promise<void> {
-    if (!this.client) throw new Error("S3 Client invalid");
+    if (!this.config) throw new Error("S3 Client invalid");
 
-    // 1. Copy
-    // CopySource must be URL encoded (bucket/key).
-    const copySource = `${sourceBucket}/${encodeURIComponent(sourceKey)}`;
+    if (this.useElectronProxy) {
+      const copyResult = await (window as any).electron.s3.copyObject(this.config, sourceKey, destKey);
+      if (!copyResult.success) {
+        throw new Error(copyResult.error || 'Copy failed');
+      }
 
-    await this.client.send(new CopyObjectCommand({
-      Bucket: destBucket,
-      Key: destKey,
-      CopySource: copySource
-    }));
+      const deleteResult = await (window as any).electron.s3.deleteObject(this.config, sourceKey);
+      if (!deleteResult.success) {
+        throw new Error(deleteResult.error || 'Delete failed');
+      }
+      return;
+    }
 
-    // 2. Delete Original
-    await this.client.send(new DeleteObjectCommand({
-      Bucket: sourceBucket,
-      Key: sourceKey
-    }));
+    throw new Error('Electron S3 proxy not available');
   }
 
   async moveFolder(sourceBucket: string, sourcePrefix: string, destBucket: string, destPrefix: string): Promise<void> {
-    if (!this.client) throw new Error("S3 Client invalid");
+    if (!this.config) throw new Error("S3 Client invalid");
 
-    // 1. List all objects in source folder
     const objects = await this.listAllObjects(sourcePrefix);
     if (objects.length === 0) return;
 
-    // 2. Move each object
     for (const obj of objects) {
       const relativePath = obj.Key.substring(sourcePrefix.length);
       const newKey = `${destPrefix}${relativePath}`;
@@ -488,32 +294,20 @@ export class S3Service {
     }
   }
 
-  private getMimeType(filename: string): string {
-    const ext = filename.split('.').pop()?.toLowerCase();
-    switch (ext) {
-      case 'png': return 'image/png';
-      case 'jpg':
-      case 'jpeg': return 'image/jpeg';
-      case 'gif': return 'image/gif';
-      case 'svg': return 'image/svg+xml';
-      case 'webp': return 'image/webp';
-      case 'pdf': return 'application/pdf';
-      case 'txt': return 'text/plain';
-      case 'json': return 'application/json';
-      case 'js': return 'application/javascript';
-      case 'ts': return 'text/plain';
-      case 'tsx': return 'text/plain';
-      case 'jsx': return 'text/plain';
-      case 'css': return 'text/css';
-      case 'html': return 'text/html';
-      case 'zip':
-      case 'rar':
-      case '7z': return 'application/zip';
-      case 'mp4':
-      case 'mov': return 'video/mp4';
-      case 'mp3':
-      case 'wav': return 'audio/mpeg';
-      default: return 'application/octet-stream';
+  async getObject(key: string): Promise<{ data: Uint8Array; contentType: string }> {
+    if (!this.config) throw new Error("S3 Client invalid");
+
+    if (this.useElectronProxy) {
+      const result = await (window as any).electron.s3.getObject(this.config, key);
+      if (result.success && result.data) {
+        return {
+          data: new Uint8Array(result.data),
+          contentType: result.contentType || 'application/octet-stream'
+        };
+      }
+      throw new Error(result.error || 'Unknown error');
     }
+
+    throw new Error('Electron S3 proxy not available');
   }
 }
