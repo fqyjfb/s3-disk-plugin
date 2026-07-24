@@ -1,14 +1,16 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
     Folder, FileText, Image as ImageIcon, Music, Video, Code, Archive,
     MoreVertical, Download, Trash2, Share2, ChevronRight, Home,
     ArrowLeft, Search, X, Upload, Check, Loader2, Copy,
     ChevronLeft, ChevronRight as ChevronRightIcon, Edit2, Save,
     Database, FilePlus, Move, CheckSquare, Link, Eye,
-    RefreshCw, List, Grid,
-    AlertCircle, PenTool, BookOpen, UploadCloud,
-    FolderPlus, ArrowUpDown, Info, FileJson, FileSpreadsheet, Binary, Tag,
-    ArrowUp, ArrowDown
+    Film, Package, FileCode, File as FileIcon, RefreshCw, List, Grid,
+    AlertTriangle, AlertCircle, PenTool, BookOpen, MousePointer2, CheckCircle2,
+    ShieldAlert, Lock, FolderInput, TerminalSquare, HardDrive, UploadCloud,
+    FileJson, FileSpreadsheet, Terminal, Binary, FolderPlus, Type, ArrowUpDown,
+    ArrowUp, ArrowDown, Info, Calendar, HardDriveDownload, Tag
 } from 'lucide-react';
 import { S3Service, formatBytes } from '../services/s3Service';
 import { FileObject, BucketObject, ViewMode } from '../types';
@@ -27,10 +29,13 @@ import DocxPreview from './DocxPreview';
 import XlsxPreview from './XlsxPreview';
 import { useIsMobile } from '../hooks/useIsMobile';
 import exifr from 'exifr';
+import { useSwipeGesture } from '../hooks/useSwipeGesture';
+import { usePinchZoom } from '../hooks/usePinchZoom';
 import { useEdgeSwipe } from '../hooks/useEdgeSwipe';
 import { useSafeArea } from '../hooks/useSafeArea';
 import { useDebounce } from '../hooks/useDebounce';
 import { useVirtualizer } from '@tanstack/react-virtual';
+import { useLongPressDrag } from '../hooks/useLongPressDrag';
 
 interface ExplorerProps {
     s3: S3Service;
@@ -40,79 +45,209 @@ interface ExplorerProps {
     readOnly?: boolean;
 }
 
+// Helper to extract clean error messages from AWS SDK objects
 const getAwsErrorMessage = (err: any) => {
-    if (!err) return { title: "未知错误", message: "发生未知错误。", details: "", docLink: "" };
-    const code = err.name || err.Code || "错误";
-    const message = err.message || "出错了。";
+    if (!err) {
+        return {
+            title: "Unknown Error",
+            message: "An unknown error occurred.",
+            details: "",
+            docLink: ""
+        };
+    }
+
+    const code = err.name || err.Code || "Error";
+    const message = err.message || "Something went wrong.";
+
+    // Handle Network / CORS Errors explicitly
     if (message === 'Failed to fetch' || code === 'TypeError') {
-        return { title: "连接失败 (CORS)", message: "浏览器被阻止连接到您的存储桶。", details: "这通常是因为您的存储桶缺少 CORS 配置。", docLink: "" };
+        return {
+            title: "Connection Failed (CORS)",
+            message: "The browser was blocked from connecting to your bucket.",
+            details: `This is almost always caused by missing CORS(Cross - Origin Resource Sharing) configuration on your bucket.\n\nTo fix this, go to the 'Permissions' tab of your bucket in the AWS Console, scroll to 'Cross-origin resource sharing (CORS)', and paste this configuration: \n\n[\n    { \n        "AllowedHeaders": ["*"], \n        "AllowedMethods": ["GET", "PUT", "POST", "DELETE", "HEAD"], \n        "AllowedOrigins": ["*"], \n        "ExposeHeaders": ["ETag", "x-amz-meta-custom-header"]\n } \n]`,
+            docLink: "https://docs.aws.amazon.com/AmazonS3/latest/userguide/ManageCorsUsing.html"
+        };
     }
+
     if (code === 'AccessDenied' || err.$metadata?.httpStatusCode === 403) {
-        return { title: "访问被拒绝", message: "您没有足够的权限执行此操作。", details: `错误代码: ${code}\n消息: ${message}`, docLink: "" };
+        return {
+            title: "Access Denied",
+            message: "You do not have sufficient permissions to perform this action.",
+            details: `Error Code: ${code} \nMessage: ${message} \n\nTo fix this, please check: \n1.IAM User Policy: Ensure you have 's3:ListBucket' and 's3:GetObject' permissions.\n2.Bucket Policy: Ensure there are no 'Deny' statements blocking your user.\n3.Public Access Settings: If this is a public bucket, ensure 'Block all public access' is unchecked.`,
+            docLink: "https://aws.amazon.com/premiumsupport/knowledge-center/s3-troubleshoot-403/"
+        };
     }
-    return { title: code === '错误' ? '操作失败' : code, message, details: JSON.stringify(err, null, 2), docLink: "" };
+
+    return {
+        title: code === 'Error' ? 'Operation Failed' : code,
+        message: message,
+        details: JSON.stringify(err, null, 2),
+        docLink: ""
+    };
 };
 
 const Explorer: React.FC<ExplorerProps> = ({ s3, bucketName, onUpload, onBackToBuckets, readOnly = false }) => {
     const [currentPrefix, setCurrentPrefix] = useState('');
     const [files, setFiles] = useState<FileObject[]>([]);
     const [loading, setLoading] = useState(false);
-    const [viewError, setViewError] = useState<{ title: string; message: string } | null>(null);
+    const [viewError, setViewError] = useState<{ title: string, message: string, code?: string, docLink?: string, details?: string } | null>(null);
+    const [editorPreviewHtml, setEditorPreviewHtml] = useState('');
     const isMobile = useIsMobile();
+
+    // Edge swipe for back navigation
+    const { handlers: edgeSwipeHandlers, swipeProgress, isEdgeSwipe } = useEdgeSwipe({
+        onSwipeComplete: () => {
+            if (currentPrefix) {
+                handleUp();
+            } else if (onBackToBuckets) {
+                onBackToBuckets();
+            }
+        },
+        enabled: isMobile
+    });
+
+    // Initialize S3 and load files, setViewMode] = useState<ViewMode>(ViewMode.LIST);
     const [viewMode, setViewMode] = useState<ViewMode>(ViewMode.LIST);
     const [searchInput, setSearchInput] = useState('');
-    const search = useDebounce(searchInput, 300);
+    const search = useDebounce(searchInput, 300); // Debounced search
     const [refreshTrigger, setRefreshTrigger] = useState(0);
+
+    // Safe area insets
     const safeArea = useSafeArea();
-    const fileInputRef = useRef<HTMLInputElement>(null);
+
+    // Long-press drag for mobile
+    const { dragState, handlers: dragHandlers, setDropTarget } = useLongPressDrag({
+        onDragStart: (file) => {
+            console.log('Drag started:', file.name);
+        },
+        onDragEnd: async (source, target) => {
+            if (!target || source.key === target.key) return;
+            setProcessingState(`Moving ${source.name}...`);
+            try {
+                const newKey = `${target.key}${source.name}`;
+                if (source.isFolder) {
+                    await s3.moveFolder(bucketName, source.key, bucketName, newKey);
+                } else {
+                    await s3.moveObject(bucketName, source.key, bucketName, newKey);
+                }
+                setRefreshTrigger(p => p + 1);
+                setNotification(`Moved ${source.name} to ${target.name}`);
+            } catch (e) {
+                console.error('Move failed:', e);
+                setNotification('Move failed');
+            } finally {
+                setProcessingState(null);
+            }
+        }
+    });
+
+    // Desktop Drag and Drop Handlers
+    const handleDragStart = (e: React.DragEvent, file: FileObject) => {
+        if (isMobile) return;
+        e.dataTransfer.setData('application/json', JSON.stringify(file));
+        e.dataTransfer.effectAllowed = 'move';
+        // Set drag image if needed, or let browser handle it
+    };
+
+    const handleDragOver = (e: React.DragEvent, targetFolder: FileObject) => {
+        if (isMobile) return;
+        e.preventDefault(); // Necessary to allow dropping
+        if (!targetFolder.isFolder) return;
+        e.dataTransfer.dropEffect = 'move';
+        e.currentTarget.classList.add('bg-blue-500/20');
+    };
+
+    const handleDragLeave = (e: React.DragEvent) => {
+        if (isMobile) return;
+        e.currentTarget.classList.remove('bg-blue-500/20');
+    };
+
+    const handleDrop = async (e: React.DragEvent, targetFolder: FileObject) => {
+        if (isMobile) return;
+        e.preventDefault();
+        e.stopPropagation();
+        e.currentTarget.classList.remove('bg-blue-500/20');
+
+        if (!targetFolder.isFolder) return;
+
+        try {
+            const data = e.dataTransfer.getData('application/json');
+            if (!data) return;
+
+            const sourceFile: FileObject = JSON.parse(data);
+
+            // Prevent moving into itself or same folder
+            if (sourceFile.key === targetFolder.key) return;
+
+            // Reuse the move logic
+            setProcessingState(`Moving ${sourceFile.name}...`);
+            try {
+                const newKey = `${targetFolder.key}${sourceFile.name}`;
+                if (sourceFile.isFolder) {
+                    await s3.moveFolder(bucketName, sourceFile.key, bucketName, newKey);
+                } else {
+                    await s3.moveObject(bucketName, sourceFile.key, bucketName, newKey);
+                }
+                setRefreshTrigger(p => p + 1);
+                setNotification(`Moved ${sourceFile.name} to ${targetFolder.name}`);
+            } catch (e) {
+                console.error('Move failed:', e);
+                setNotification('Move failed');
+            } finally {
+                setProcessingState(null);
+            }
+
+        } catch (err) {
+            console.error('Drop failed', err);
+        }
+    };
 
     // Preview
-    const [previewFile, setPreviewFile] = useState<{ file: FileObject; url: string; content?: string; data?: ArrayBuffer } | null>(null);
+    const [previewFile, setPreviewFile] = useState<{ file: FileObject, url: string, content?: string, data?: ArrayBuffer } | null>(null);
     const [isPreviewLoading, setIsPreviewLoading] = useState(false);
     const [isEditing, setIsEditing] = useState(false);
     const [editorContent, setEditorContent] = useState('');
+    const [editorScrollTop, setEditorScrollTop] = useState(0);
     const [mdTab, setMdTab] = useState<'write' | 'preview'>('write');
-    const [editorPreviewHtml, setEditorPreviewHtml] = useState('');
 
     // Selection
     const [selectionMode, setSelectionMode] = useState(false);
     const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
 
     // Long-press context menu
-    const [contextMenu, setContextMenu] = useState<{ show: boolean; file: FileObject | null; x: number; y: number }>({
+    const [contextMenu, setContextMenu] = useState<{ show: boolean, file: FileObject | null, x: number, y: number }>({
         show: false, file: null, x: 0, y: 0
     });
     const longPressTimer = useRef<NodeJS.Timeout | null>(null);
 
     // Modals
-    const [shareModal, setShareModal] = useState<{ show: boolean; file: FileObject | null; url: string | null; duration: number }>({
+    const [shareModal, setShareModal] = useState<{ show: boolean, file: FileObject | null, url: string | null, duration: number }>({
         show: false, file: null, url: null, duration: 3600
     });
-    const [deleteConfirmation, setDeleteConfirmation] = useState<{ show: boolean; isBulk?: boolean }>({ show: false });
-    const [createFileModal, setCreateFileModal] = useState<{ show: boolean; filename: string; content: string }>({
+    const [deleteConfirmation, setDeleteConfirmation] = useState<{ show: boolean, isBulk?: boolean }>({ show: false });
+    const [createFileModal, setCreateFileModal] = useState<{ show: boolean, filename: string, content: string }>({
         show: false, filename: '', content: ''
     });
-    const [moveModal, setMoveModal] = useState<{ show: boolean; targetBucket: string; targetPrefix: string; bucketList: BucketObject[] }>({
+    const [moveModal, setMoveModal] = useState<{ show: boolean, targetBucket: string, targetPrefix: string, bucketList: BucketObject[] }>({
         show: false, targetBucket: bucketName, targetPrefix: currentPrefix, bucketList: []
     });
-    const [renameModal, setRenameModal] = useState<{ show: boolean; file: FileObject | null; newName: string }>({
+    const [renameModal, setRenameModal] = useState<{ show: boolean, file: FileObject | null, newName: string }>({
         show: false, file: null, newName: ''
     });
-    const [createFolderModal, setCreateFolderModal] = useState<{ show: boolean; folderName: string }>({
+    const [createFolderModal, setCreateFolderModal] = useState<{ show: boolean, folderName: string }>({
         show: false, folderName: ''
     });
     const [sortBy, setSortBy] = useState<'name' | 'size' | 'date'>('name');
     const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('asc');
     const [showMetadata, setShowMetadata] = useState(false);
+    const [metadataFile, setMetadataFile] = useState<FileObject | null>(null);
     const [exifData, setExifData] = useState<any>(null);
-    const [actionError, setActionError] = useState<{ show: boolean; title: string; message: string; details?: string } | null>(null);
-
-    // Upload
-    const folderInputRef = useRef<HTMLInputElement>(null);
+    const [actionError, setActionError] = useState<{ show: boolean, title: string, message: string, details?: string, docLink?: string } | null>(null);
 
     // UI State
     const [processingState, setProcessingState] = useState<string | null>(null);
     const [notification, setNotification] = useState<string | null>(null);
+    const fileInputRef = useRef<HTMLInputElement>(null);
 
     // Pull to refresh
     const [isPulling, setIsPulling] = useState(false);
@@ -120,270 +255,420 @@ const Explorer: React.FC<ExplorerProps> = ({ s3, bucketName, onUpload, onBackToB
     const pullStartY = useRef(0);
     const listRef = useRef<HTMLDivElement>(null);
 
-    // Virtual scrolling
-    const ROW_HEIGHT = 56;
-    const virtualizer = useVirtualizer({
-        count: filteredFiles.length,
-        getScrollElement: () => listRef.current,
-        estimateSize: () => ROW_HEIGHT,
-        overscan: 5,
-        horizontal: false,
-    });
+    const handleTouchStart = (e: React.TouchEvent) => {
+        if (listRef.current && listRef.current.scrollTop === 0) {
+            pullStartY.current = e.touches[0].clientY;
+        }
+    };
 
-    // Edge swipe for back navigation
-    const { handlers: edgeSwipeHandlers } = useEdgeSwipe({
-        onSwipeComplete: () => { if (currentPrefix) handleUp(); else if (onBackToBuckets) onBackToBuckets(); },
-        enabled: isMobile
-    });
+    const handleTouchMove = (e: React.TouchEvent) => {
+        if (!listRef.current || listRef.current.scrollTop > 0 || pullStartY.current === 0) return;
 
-    useEffect(() => { setCurrentPrefix(''); setSelectedKeys(new Set()); setSelectionMode(false); setViewError(null); }, [bucketName]);
-    useEffect(() => { loadFiles(); }, [currentPrefix, refreshTrigger, bucketName]);
-    useEffect(() => { if (notification) { const timer = setTimeout(() => setNotification(null), 3000); return () => clearTimeout(timer); } }, [notification]);
+        const currentY = e.touches[0].clientY;
+        const diff = currentY - pullStartY.current;
+
+        if (diff > 0) {
+            setIsPulling(true);
+            // Add resistance
+            setPullDistance(Math.min(diff * 0.5, 80));
+        }
+    };
+
+    const handleTouchEnd = async () => {
+        if (isPulling && pullDistance > 50) {
+            await loadFiles();
+        }
+        setIsPulling(false);
+        setPullDistance(0);
+        pullStartY.current = 0;
+    };
+
+    useEffect(() => {
+        setCurrentPrefix('');
+        setSelectedKeys(new Set());
+        setSelectionMode(false);
+        setViewError(null);
+    }, [bucketName]);
+
+    useEffect(() => {
+        loadFiles();
+    }, [currentPrefix, refreshTrigger, bucketName]);
+
+    // Notification Timer
+    useEffect(() => {
+        if (notification) {
+            const timer = setTimeout(() => setNotification(null), 3000);
+            return () => clearTimeout(timer);
+        }
+    }, [notification]);
 
     // Listen for Command Palette Events
     useEffect(() => {
         const toggleViewHandler = () => setViewMode(v => v === ViewMode.LIST ? ViewMode.GRID : ViewMode.LIST);
         const triggerUploadHandler = () => fileInputRef.current?.click();
         const triggerCreateHandler = () => setCreateFileModal(prev => ({ ...prev, show: true }));
+
         window.addEventListener('s4:toggle-view', toggleViewHandler);
         window.addEventListener('s4:trigger-upload', triggerUploadHandler);
         window.addEventListener('s4:create-file', triggerCreateHandler);
-        return () => { window.removeEventListener('s4:toggle-view', toggleViewHandler); window.removeEventListener('s4:trigger-upload', triggerUploadHandler); window.removeEventListener('s4:create-file', triggerCreateHandler); };
+
+        return () => {
+            window.removeEventListener('s4:toggle-view', toggleViewHandler);
+            window.removeEventListener('s4:trigger-upload', triggerUploadHandler);
+            window.removeEventListener('s4:create-file', triggerCreateHandler);
+        };
     }, []);
 
     // Keyboard Shortcuts
     useEffect(() => {
         const handleKeyDown = (e: KeyboardEvent) => {
+            // Spacebar for Quick Look (desktop only) - like macOS preview
             if (e.key === ' ' && !isMobile && !isEditing && !previewFile && !createFileModal.show && !actionError?.show && !moveModal.show) {
                 e.preventDefault();
-                if (selectedKeys.size === 1) { const selectedKey = Array.from(selectedKeys)[0]; const file = files.find(f => f.key === selectedKey); if (file && !file.isFolder) handlePreview(file); }
+                if (selectedKeys.size === 1) {
+                    const selectedKey = Array.from(selectedKeys)[0];
+                    const file = files.find(f => f.key === selectedKey);
+                    if (file && !file.isFolder) {
+                        handlePreview(file);
+                    }
+                }
             }
-            if ((e.key === 'Backspace' || e.key === 'Delete') && selectedKeys.size > 0 && !readOnly && !isEditing && !previewFile && !createFileModal.show && !actionError?.show && !moveModal.show) {
-                setDeleteConfirmation({ show: true, isBulk: true });
+            // Delete
+            if (e.key === 'Backspace' || e.key === 'Delete') {
+                if (selectedKeys.size > 0 && !readOnly && !isEditing && !previewFile && !createFileModal.show && !actionError?.show && !moveModal.show) {
+                    setDeleteConfirmation({ show: true, isBulk: true });
+                }
             }
+            // Escape
             if (e.key === 'Escape') {
                 if (actionError?.show) setActionError(null);
                 else if (previewFile) closePreview();
                 else if (createFileModal.show) setCreateFileModal(prev => ({ ...prev, show: false }));
                 else if (moveModal.show) setMoveModal(prev => ({ ...prev, show: false }));
                 else if (deleteConfirmation.show) setDeleteConfirmation({ show: false });
-                else if (selectionMode) { setSelectionMode(false); setSelectedKeys(new Set()); }
-                else if (selectedKeys.size > 0) setSelectedKeys(new Set());
+                else if (selectionMode) {
+                    setSelectionMode(false);
+                    setSelectedKeys(new Set());
+                } else if (selectedKeys.size > 0) {
+                    setSelectedKeys(new Set());
+                }
             }
-            if (previewFile && !isEditing) { if (e.key === 'ArrowRight') navigatePreview(1); if (e.key === 'ArrowLeft') navigatePreview(-1); }
+            // Navigation in Lightbox
+            if (previewFile && !isEditing) {
+                if (e.key === 'ArrowRight') navigatePreview(1);
+                if (e.key === 'ArrowLeft') navigatePreview(-1);
+            }
         };
         window.addEventListener('keydown', handleKeyDown);
         return () => window.removeEventListener('keydown', handleKeyDown);
     }, [selectedKeys, readOnly, previewFile, isEditing, selectionMode, createFileModal.show, deleteConfirmation.show, actionError, moveModal.show, files, isMobile]);
 
     const loadFiles = async () => {
-        setLoading(true); setViewError(null);
-        try { const data = await s3.listFiles(currentPrefix); setFiles(data); setSelectedKeys(new Set()); }
-        catch (err: any) { console.error(err); const errorInfo = getAwsErrorMessage(err); setViewError({ title: errorInfo.title, message: errorInfo.message }); }
-        finally { setLoading(false); }
+        setLoading(true);
+        setViewError(null);
+        try {
+            const data = await s3.listFiles(currentPrefix);
+            setFiles(data);
+            setSelectedKeys(new Set());
+        } catch (err: any) {
+            console.error(err);
+            const errorInfo = getAwsErrorMessage(err);
+            setViewError({
+                title: errorInfo.title,
+                message: errorInfo.message,
+                code: err.name || "Error",
+                docLink: errorInfo.docLink,
+                details: errorInfo.details
+            });
+        } finally {
+            setLoading(false);
+        }
     };
 
-    const handleNavigate = (prefix: string) => { setCurrentPrefix(prefix); setSearchInput(''); setSelectedKeys(new Set()); };
+    const handleNavigate = (prefix: string) => {
+        setCurrentPrefix(prefix);
+        setSearchInput('');
+        // Always clear selection on navigation
+        setSelectedKeys(new Set());
+    };
+
     const handleUp = () => {
-        if (!currentPrefix) { if (onBackToBuckets) onBackToBuckets(); return; }
-        const parts = currentPrefix.split('/').filter(Boolean); parts.pop();
+        if (!currentPrefix) {
+            if (onBackToBuckets) onBackToBuckets();
+            return;
+        }
+        const parts = currentPrefix.split('/').filter(Boolean);
+        parts.pop();
         setCurrentPrefix(parts.length > 0 ? parts.join('/') + '/' : '');
     };
 
+    // Filter and sort files
     const filteredFiles = files
         .filter(f => f.name.toLowerCase().includes(search.toLowerCase()))
         .sort((a, b) => {
+            // Always sort folders first
             if (a.isFolder && !b.isFolder) return -1;
             if (!a.isFolder && b.isFolder) return 1;
+
             let comparison = 0;
-            if (sortBy === 'name') comparison = a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
-            else if (sortBy === 'size') comparison = a.size - b.size;
-            else if (sortBy === 'date') comparison = a.lastModified.getTime() - b.lastModified.getTime();
+            if (sortBy === 'name') {
+                comparison = a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+            } else if (sortBy === 'size') {
+                comparison = a.size - b.size;
+            } else if (sortBy === 'date') {
+                comparison = a.lastModified.getTime() - b.lastModified.getTime();
+            }
+
             return sortDirection === 'asc' ? comparison : -comparison;
         });
 
-    const toggleSelectionMode = () => { const newMode = !selectionMode; setSelectionMode(newMode); if (!newMode) setSelectedKeys(new Set()); };
+    // --- INTERACTION LOGIC ---
 
-    const handleSelectAll = () => { setSelectedKeys(new Set(filteredFiles.map(f => f.key))); };
-
-    const handleContextMenu = (file: FileObject, e: React.MouseEvent) => {
-        e.preventDefault();
-        setContextMenu({ show: true, file, x: e.clientX, y: e.clientY });
+    const toggleSelectionMode = () => {
+        const newMode = !selectionMode;
+        setSelectionMode(newMode);
+        if (!newMode) {
+            setSelectedKeys(new Set());
+        }
     };
 
-    useEffect(() => {
-        const handleClickOutside = () => {
-            setContextMenu(prev => ({ ...prev, show: false }));
-        };
-        if (contextMenu.show) {
-            document.addEventListener('click', handleClickOutside);
-        }
-        return () => {
-            document.removeEventListener('click', handleClickOutside);
-        };
-    }, [contextMenu.show]);
-
+    // Long-press handlers
     const handleLongPressStart = (file: FileObject, e: React.TouchEvent | React.MouseEvent) => {
         const touch = 'touches' in e ? e.touches[0] : e;
-        longPressTimer.current = setTimeout(() => { setContextMenu({ show: true, file, x: touch.clientX, y: touch.clientY }); if ('vibrate' in navigator) navigator.vibrate(50); }, 500);
+        longPressTimer.current = setTimeout(() => {
+            setContextMenu({ show: true, file, x: touch.clientX, y: touch.clientY });
+            // Haptic feedback if available
+            if ('vibrate' in navigator) {
+                navigator.vibrate(50);
+            }
+        }, 500); // 500ms long press
     };
-    const handleLongPressEnd = () => { if (longPressTimer.current) { clearTimeout(longPressTimer.current); longPressTimer.current = null; } };
+
+    const handleLongPressEnd = () => {
+        if (longPressTimer.current) {
+            clearTimeout(longPressTimer.current);
+            longPressTimer.current = null;
+        }
+    };
 
     const handleItemClick = (file: FileObject, e: React.MouseEvent) => {
         e.stopPropagation();
+
         if (selectionMode) {
+            // Selection Mode: Toggle selection only
             const newSelected = new Set(selectedKeys);
-            if (newSelected.has(file.key)) newSelected.delete(file.key); else newSelected.add(file.key);
+            if (newSelected.has(file.key)) {
+                newSelected.delete(file.key);
+            } else {
+                newSelected.add(file.key);
+            }
             setSelectedKeys(newSelected);
         } else {
-            if (file.isFolder) handleNavigate(file.key); else handlePreview(file);
+            // Default Mode: Navigate or Preview
+            if (file.isFolder) {
+                handleNavigate(file.key);
+            } else {
+                handlePreview(file);
+            }
         }
-    };
-
-    // Desktop Drag and Drop
-    const handleDragStart = (e: React.DragEvent, file: FileObject) => { if (isMobile) return; e.dataTransfer.setData('application/json', JSON.stringify(file)); e.dataTransfer.effectAllowed = 'move'; };
-    const handleDragOver = (e: React.DragEvent, targetFolder: FileObject) => { if (isMobile) return; e.preventDefault(); if (!targetFolder.isFolder) return; e.dataTransfer.dropEffect = 'move'; };
-    const handleDragLeave = (e: React.DragEvent) => { if (isMobile) return; };
-    const handleDrop = async (e: React.DragEvent, targetFolder: FileObject) => {
-        if (isMobile) return; e.preventDefault(); e.stopPropagation();
-        if (!targetFolder.isFolder) return;
-        try {
-            const data = e.dataTransfer.getData('application/json'); if (!data) return;
-            const sourceFile: FileObject = JSON.parse(data);
-            if (sourceFile.key === targetFolder.key) return;
-            setProcessingState(`正在移动 ${sourceFile.name}...`);
-            const newKey = `${targetFolder.key}${sourceFile.name}`;
-            if (sourceFile.isFolder) await s3.moveFolder(bucketName, sourceFile.key, bucketName, newKey);
-            else await s3.moveObject(bucketName, sourceFile.key, bucketName, newKey);
-            setRefreshTrigger(p => p + 1); setNotification(`已将 ${sourceFile.name} 移动到 ${targetFolder.name}`);
-        } catch (err) { console.error('移动失败', err); setNotification('移动失败'); }
-        finally { setProcessingState(null); }
     };
 
     // Bulk Actions
     const handleBulkDelete = async () => {
         setDeleteConfirmation({ show: false });
         if (readOnly || selectedKeys.size === 0) return;
-        setProcessingState(`正在删除 ${selectedKeys.size} 项...`);
+
+        setProcessingState(`Deleting ${selectedKeys.size} items...`);
         try {
-            for (const key of selectedKeys) { const file = files.find(f => f.key === key); if (file?.isFolder) await s3.deleteFolder(key); else await s3.deleteFile(key); }
-            setRefreshTrigger(p => p + 1); setSelectionMode(false); setSelectedKeys(new Set());
-        } catch (e: any) { const errInfo = getAwsErrorMessage(e); setActionError({ show: true, title: "删除失败", message: errInfo.message, details: errInfo.details }); }
-        finally { setProcessingState(null); }
-    };
-
-    const handleBulkDownload = async () => {
-        if (selectedKeys.size === 0) return;
-        const filesToDownload = files.filter(f => selectedKeys.has(f.key) && !f.isFolder);
-        if (filesToDownload.length === 1) { handleDownload(filesToDownload[0]); return; }
-        setProcessingState("正在打包文件...");
-        try {
-            const blob = await s3.downloadFilesAsZip(filesToDownload);
-            const url = URL.createObjectURL(blob); const a = document.createElement('a');
-            a.href = url; a.download = `files_archive.zip`; document.body.appendChild(a); a.click(); document.body.removeChild(a);
-            URL.revokeObjectURL(url); setSelectionMode(false); setSelectedKeys(new Set());
-        } catch (e: any) { setActionError({ show: true, title: "下载失败", message: "无法生成 ZIP 文件。", details: getAwsErrorMessage(e).details }); }
-        finally { setProcessingState(null); }
-    };
-
-    const handleDownload = async (file: FileObject) => {
-        if (file.isFolder) {
-            if (!confirm(`准备下载文件夹 "${file.name}"？这将获取所有文件。`)) return;
-            setProcessingState("正在打包文件夹...");
-            try {
-                const blob = await s3.downloadFolderAsZip(file.key);
-                const url = URL.createObjectURL(blob); const a = document.createElement('a');
-                a.href = url; a.download = `${file.name.replace(/\/$/, '')}.zip`; document.body.appendChild(a); a.click(); document.body.removeChild(a);
-            } catch (e: any) { setActionError({ show: true, title: "文件夹下载失败", message: getAwsErrorMessage(e).message, details: getAwsErrorMessage(e).details }); }
-            finally { setProcessingState(null); }
-        } else {
-            setProcessingState("正在下载...");
-            try {
-                const url = await s3.getPresignedUrl(file.key, { download: true }); const a = document.createElement('a');
-                a.href = url; a.download = file.name; document.body.appendChild(a); a.click(); document.body.removeChild(a);
-            } catch (e: any) { setActionError({ show: true, title: "下载失败", message: getAwsErrorMessage(e).message, details: getAwsErrorMessage(e).details }); }
-            finally { setProcessingState(null); }
-        }
-    };
-
-    const handleCopyS3Path = async (file: FileObject) => {
-        const path = `s3://${bucketName}/${file.key}`;
-        try { await navigator.clipboard.writeText(path); setNotification("S3 URI 已复制到剪贴板"); }
-        catch (e) { console.error("复制失败", e); }
-    };
-
-    const handleCopyFile = async (file: FileObject) => {
-        const newKey = `${currentPrefix}副本_${file.name}${file.isFolder ? '/' : ''}`;
-        setProcessingState(`正在复制 ${file.name}...`);
-        try {
-            if (file.isFolder) {
-                await s3.moveFolder(bucketName, file.key, bucketName, newKey);
-            } else {
-                await s3.copyObject(bucketName, file.key, bucketName, newKey);
+            for (const key of selectedKeys) {
+                const file = files.find(f => f.key === key);
+                if (file?.isFolder) await s3.deleteFolder(key);
+                else await s3.deleteFile(key);
             }
             setRefreshTrigger(p => p + 1);
-            setNotification(`已复制 ${file.name}`);
-        } catch (e) {
-            console.error("复制失败", e);
-            setNotification("复制失败");
+            setSelectionMode(false); // Exit selection mode after action
+            setSelectedKeys(new Set());
+        } catch (e: any) {
+            const errInfo = getAwsErrorMessage(e);
+            setActionError({
+                show: true,
+                title: "删除失败",
+                message: errInfo.message,
+                details: errInfo.details,
+                docLink: errInfo.docLink
+            });
         } finally {
             setProcessingState(null);
         }
     };
 
-    const handleBulkCopy = async () => {
-        const selected = filteredFiles.filter(f => selectedKeys.has(f.key));
-        if (selected.length === 0) return;
-        setProcessingState(`正在复制 ${selected.length} 项...`);
-        let success = 0;
-        for (const file of selected) {
+    const handleBulkDownload = async () => {
+        if (selectedKeys.size === 0) return;
+
+        const filesToDownload = files.filter(f => selectedKeys.has(f.key) && !f.isFolder);
+
+        if (filesToDownload.length === 1) {
+            handleDownload(filesToDownload[0]);
+            return;
+        }
+
+        setProcessingState("Zipping files...");
+        try {
+            const blob = await s3.downloadFilesAsZip(filesToDownload);
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `files_archive.zip`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            setSelectionMode(false);
+            setSelectedKeys(new Set());
+        } catch (e: any) {
+            const errInfo = getAwsErrorMessage(e);
+            setActionError({
+                show: true,
+                title: "下载失败",
+                message: "无法生成 ZIP 文件。",
+                details: errInfo.details,
+                docLink: errInfo.docLink
+            });
+        } finally {
+            setProcessingState(null);
+        }
+    };
+
+    const handleDownload = async (file: FileObject) => {
+        if (file.isFolder) {
+            if (!confirm(`Prepare download for folder "${file.name}" ? This will fetch all files.`)) return;
+            setProcessingState("Zipping folder...");
             try {
-                const newKey = `${currentPrefix}副本_${file.name}${file.isFolder ? '/' : ''}`;
-                if (file.isFolder) {
-                    await s3.moveFolder(bucketName, file.key, bucketName, newKey);
-                } else {
-                    await s3.copyObject(bucketName, file.key, bucketName, newKey);
-                }
-                success++;
-            } catch (e) {
-                console.error("复制失败", file.name, e);
+                const blob = await s3.downloadFolderAsZip(file.key);
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `${file.name.replace(/\/$/, '')}.zip`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+            } catch (e: any) {
+                const errInfo = getAwsErrorMessage(e);
+                setActionError({
+                    show: true,
+                    title: "Folder Download Failed",
+                    message: errInfo.message,
+                    details: errInfo.details,
+                    docLink: errInfo.docLink
+                });
+            } finally {
+                setProcessingState(null);
+            }
+        } else {
+            setProcessingState("Downloading...");
+            try {
+                const url = await s3.getPresignedUrl(file.key, { download: true });
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = file.name;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+            } catch (e: any) {
+                const errInfo = getAwsErrorMessage(e);
+                setActionError({
+                    show: true,
+                    title: "下载失败",
+                    message: errInfo.message,
+                    details: errInfo.details,
+                    docLink: errInfo.docLink
+                });
+            } finally {
+                setProcessingState(null);
             }
         }
-        setRefreshTrigger(p => p + 1);
-        setNotification(`已复制 ${success}/${selected.length} 项`);
-        setSelectionMode(false);
-        setSelectedKeys(new Set());
-        setProcessingState(null);
+    };
+
+    const handleCopyS3Path = async (file: FileObject) => {
+        const path = `s3://${bucketName}/${file.key}`;
+        try {
+            await navigator.clipboard.writeText(path);
+            setNotification("S3 URI copied to clipboard");
+        } catch (e) {
+            console.error("Failed to copy", e);
+        }
     };
 
     const openMoveModal = async () => {
-        setProcessingState("正在获取存储桶...");
+        setProcessingState("Fetching buckets...");
         try {
+            // We need to fetch available buckets for the destination dropdown
             const buckets = await s3.listBuckets();
-            setMoveModal({ show: true, targetBucket: bucketName, targetPrefix: currentPrefix, bucketList: buckets });
-        } catch (e) { setActionError({ show: true, title: "无法加载存储桶", message: "无法列出存储桶以供目标选择。", details: getAwsErrorMessage(e).details }); }
-        finally { setProcessingState(null); }
+            setMoveModal({
+                show: true,
+                targetBucket: bucketName,
+                targetPrefix: currentPrefix,
+                bucketList: buckets
+            });
+        } catch (e) {
+            const errInfo = getAwsErrorMessage(e);
+            setActionError({
+                show: true,
+                title: "无法加载存储桶",
+                message: "无法列出目标存储桶。",
+                details: errInfo.details,
+                docLink: errInfo.docLink
+            });
+        } finally {
+            setProcessingState(null);
+        }
     };
 
     const handleMoveSelected = async () => {
-        const { targetBucket, targetPrefix } = moveModal; if (!targetBucket) return;
-        setProcessingState(`正在移动 ${selectedKeys.size} 项...`);
+        const { targetBucket, targetPrefix } = moveModal;
+        if (!targetBucket) return;
+
+        setProcessingState(`Moving ${selectedKeys.size} items...`);
         try {
-            for (const key of selectedKeys) { const file = files.find(f => f.key === key); if (!file) continue;
-                if (file.isFolder) await s3.moveFolder(bucketName, key, targetBucket, targetPrefix + file.name);
-                else await s3.moveObject(bucketName, key, targetBucket, targetPrefix + file.name);
+            for (const key of selectedKeys) {
+                const file = files.find(f => f.key === key);
+                if (!file) continue;
+
+                if (file.isFolder) {
+                    await s3.moveFolder(bucketName, key, targetBucket, targetPrefix + file.name);
+                } else {
+                    await s3.moveObject(bucketName, key, targetBucket, targetPrefix + file.name);
+                }
             }
-            setMoveModal(prev => ({ ...prev, show: false })); setRefreshTrigger(p => p + 1); setSelectionMode(false); setSelectedKeys(new Set());
-            setNotification(`成功移动 ${selectedKeys.size} 项。`);
-        } catch (e: any) { setActionError({ show: true, title: "移动失败", message: getAwsErrorMessage(e).message, details: getAwsErrorMessage(e).details }); }
-        finally { setProcessingState(null); }
+
+            setMoveModal(prev => ({ ...prev, show: false }));
+            setRefreshTrigger(p => p + 1);
+            setSelectionMode(false);
+            setSelectedKeys(new Set());
+            setNotification(`Moved ${selectedKeys.size} items successfully.`);
+        } catch (e: any) {
+            const errInfo = getAwsErrorMessage(e);
+            setActionError({
+                show: true,
+                title: "移动失败",
+                message: errInfo.message,
+                details: errInfo.details,
+                docLink: errInfo.docLink
+            });
+        } finally {
+            setProcessingState(null);
+        }
     };
 
+    // Create File
     const handleCreateFile = async () => {
         if (!createFileModal.filename.trim()) return;
-        setProcessingState("正在创建文件...");
+
+        setProcessingState("Creating file...");
         try {
             const key = `${currentPrefix}${createFileModal.filename.trim()}`;
+
+            // Basic mime detection for text files
             const ext = createFileModal.filename.split('.').pop()?.toLowerCase();
             let mimeType = 'text/plain';
             if (ext === 'json') mimeType = 'application/json';
@@ -394,45 +679,119 @@ const Explorer: React.FC<ExplorerProps> = ({ s3, bucketName, onUpload, onBackToB
             else if (ext === 'md') mimeType = 'text/markdown';
             else if (ext === 'xml') mimeType = 'application/xml';
             else if (ext === 'yml' || ext === 'yaml') mimeType = 'text/yaml';
+
             await s3.saveFileContent(key, createFileModal.content, mimeType);
-            setCreateFileModal({ show: false, filename: '', content: '' }); setRefreshTrigger(p => p + 1);
-        } catch (e: any) { setActionError({ show: true, title: "创建文件失败", message: getAwsErrorMessage(e).message, details: getAwsErrorMessage(e).details }); }
-        finally { setProcessingState(null); }
+            setCreateFileModal({ show: false, filename: '', content: '' });
+            setRefreshTrigger(p => p + 1);
+        } catch (e: any) {
+            const errInfo = getAwsErrorMessage(e);
+            setActionError({
+                show: true,
+                title: "Failed to Create File",
+                message: errInfo.message,
+                details: errInfo.details,
+                docLink: errInfo.docLink
+            });
+            // We do NOT close the create modal here, so user doesn't lose their content
+        } finally {
+            setProcessingState(null);
+        }
     };
 
-    const openRenameModal = (file: FileObject) => { setRenameModal({ show: true, file, newName: file.name }); };
+    // Rename file/folder
+    const openRenameModal = (file: FileObject) => {
+        // Extract just the filename without prefix
+        const nameWithoutPrefix = file.name;
+        setRenameModal({ show: true, file, newName: nameWithoutPrefix });
+    };
 
     const handleRename = async () => {
         if (!renameModal.file || !renameModal.newName.trim()) return;
-        const file = renameModal.file; const newName = renameModal.newName.trim();
-        if (newName === file.name) { setRenameModal({ show: false, file: null, newName: '' }); return; }
-        setProcessingState("正在重命名...");
+        
+        const file = renameModal.file;
+        const newName = renameModal.newName.trim();
+        
+        // Don't allow empty names or just whitespace
+        if (newName === file.name) {
+            setRenameModal({ show: false, file: null, newName: '' });
+            return;
+        }
+
+        setProcessingState("Renaming...");
         try {
-            const oldKey = file.key; const keyParts = oldKey.split('/'); keyParts[keyParts.length - 1] = newName; const newKey = keyParts.join('/');
-            if (file.isFolder) await s3.moveFolder(bucketName, oldKey, bucketName, newKey);
-            else await s3.moveObject(bucketName, oldKey, bucketName, newKey);
-            setNotification(`已重命名为 "${newName}"`); setRenameModal({ show: false, file: null, newName: '' }); setRefreshTrigger(p => p + 1);
-        } catch (e: any) { setActionError({ show: true, title: "重命名失败", message: getAwsErrorMessage(e).message, details: getAwsErrorMessage(e).details }); }
-        finally { setProcessingState(null); }
+            // Calculate old and new keys
+            const oldKey = file.key;
+            const keyParts = oldKey.split('/');
+            keyParts[keyParts.length - 1] = newName;
+            const newKey = keyParts.join('/');
+
+            if (file.isFolder) {
+                // Rename folder by moving all contents
+                await s3.moveFolder(bucketName, oldKey, bucketName, newKey);
+            } else {
+                // Rename file
+                await s3.moveObject(bucketName, oldKey, bucketName, newKey);
+            }
+
+            setNotification(`Renamed to "${newName}"`);
+            setRenameModal({ show: false, file: null, newName: '' });
+            setRefreshTrigger(p => p + 1);
+        } catch (e: any) {
+            const errInfo = getAwsErrorMessage(e);
+            setActionError({
+                show: true,
+                title: "重命名失败",
+                message: errInfo.message,
+                details: errInfo.details,
+                docLink: errInfo.docLink
+            });
+        } finally {
+            setProcessingState(null);
+        }
     };
 
+    // Create folder
     const handleCreateFolder = async () => {
         if (!createFolderModal.folderName.trim()) return;
+        
         const folderName = createFolderModal.folderName.trim();
+        // Ensure folder name ends with /
         const normalizedName = folderName.endsWith('/') ? folderName : folderName + '/';
-        setProcessingState("正在创建文件夹...");
+        
+        setProcessingState("Creating folder...");
         try {
             const folderKey = `${currentPrefix}${normalizedName}`;
+            // Create folder marker (empty object with trailing slash)
             await s3.saveFileContent(folderKey, '', 'application/x-directory');
-            setNotification(`文件夹 "${folderName}" 已创建`); setCreateFolderModal({ show: false, folderName: '' }); setRefreshTrigger(p => p + 1);
-        } catch (e: any) { setActionError({ show: true, title: "创建文件夹失败", message: getAwsErrorMessage(e).message, details: getAwsErrorMessage(e).details }); }
-        finally { setProcessingState(null); }
+            
+            setNotification(`Folder "${folderName}" created`);
+            setCreateFolderModal({ show: false, folderName: '' });
+            setRefreshTrigger(p => p + 1);
+        } catch (e: any) {
+            const errInfo = getAwsErrorMessage(e);
+            setActionError({
+                show: true,
+                title: "Failed to Create Folder",
+                message: errInfo.message,
+                details: errInfo.details,
+                docLink: errInfo.docLink
+            });
+        } finally {
+            setProcessingState(null);
+        }
     };
 
+    // Preview & Editing
+    // Update editor preview when tab changes or content changes
     useEffect(() => {
         const updatePreview = async () => {
             if (mdTab === 'preview' && isEditing) {
-                try { const html = await marked.parse(editorContent); setEditorPreviewHtml(html); } catch (e) { console.error("解析 Markdown 失败", e); }
+                try {
+                    const html = await marked.parse(editorContent);
+                    setEditorPreviewHtml(html);
+                } catch (e) {
+                    console.error("Failed to parse markdown", e);
+                }
             }
         };
         updatePreview();
@@ -440,578 +799,1784 @@ const Explorer: React.FC<ExplorerProps> = ({ s3, bucketName, onUpload, onBackToB
 
     const handlePreview = async (file: FileObject) => {
         if (file.isFolder) return;
-        setIsPreviewLoading(true); setIsEditing(false); setEditorContent(''); setMdTab('write');
+        setIsPreviewLoading(true);
+        setIsEditing(false);
+        setEditorContent('');
+        setEditorScrollTop(0); // Reset scroll
+        setMdTab('write');
         try {
             const url = await s3.getPresignedUrl(file.key);
             let content = undefined;
+
             if (file.name.endsWith('.md')) {
-                try { const res = await fetch(url); if (res.ok) { const text = await res.text(); const html = await marked.parse(text); setPreviewFile({ file, url, content: html }); } }
-                catch (e) { console.error("无法获取 Markdown 内容", e); }
-            } else if (['.json', '.js', '.ts', '.tsx'].includes(file.name.slice(-file.name.split('.').length))) {
-                try { const res = await fetch(url); if (res.ok) { content = await res.text(); setEditorContent(content); } }
-                catch (e) { console.error("无法获取代码内容", e); }
+                try {
+                    const res = await fetch(url);
+                    if (res.ok) {
+                        const text = await res.text();
+                        const html = await marked.parse(text);
+                        setPreviewFile({ file, url, content: html });
+                    }
+                } catch (e) {
+                    console.error("Could not fetch markdown content", e);
+                }
+            } else if (file.name.endsWith('.json') || file.name.endsWith('.js') || file.name.endsWith('.ts') || file.name.endsWith('.tsx')) {
+                try {
+                    const res = await fetch(url);
+                    if (res.ok) {
+                        content = await res.text();
+                        setEditorContent(content);
+                    }
+                } catch (e) {
+                    console.error("Could not fetch code content", e);
+                }
                 setPreviewFile({ file, url, content });
             } else if (file.mimeType?.match(/text|json|javascript|xml|sql|css|html/)) {
-                try { const res = await fetch(url); if (res.ok) { content = await res.text(); setEditorContent(content); } }
-                catch (e) { console.error("无法获取文本内容", e); }
+                try {
+                    const res = await fetch(url);
+                    if (res.ok) {
+                        content = await res.text();
+                        setEditorContent(content);
+                    }
+                } catch (e) {
+                    console.error("Could not fetch text content", e);
+                }
                 setPreviewFile({ file, url, content });
             } else if (file.mimeType === 'application/pdf' || file.name.endsWith('.pdf')) {
-                try { const res = await fetch(url); if (res.ok) { const blob = await res.blob(); const blobUrl = URL.createObjectURL(blob); setPreviewFile({ file, url: blobUrl, content }); } else setPreviewFile({ file, url, content }); }
-                catch (e) { setPreviewFile({ file, url, content }); }
+                // Fetch PDF as blob to bypass X-Frame-Options
+                try {
+                    const res = await fetch(url);
+                    if (res.ok) {
+                        const blob = await res.blob();
+                        const blobUrl = URL.createObjectURL(blob);
+                        setPreviewFile({ file, url: blobUrl, content });
+                    } else {
+                        setPreviewFile({ file, url, content });
+                    }
+                } catch (e) {
+                    console.error("Could not fetch PDF", e);
+                    setPreviewFile({ file, url, content });
+                }
             } else if (file.mimeType === 'application/epub+zip' || file.name.endsWith('.epub')) {
-                try { const res = await fetch(url); if (res.ok) { const arrayBuffer = await res.arrayBuffer(); setPreviewFile({ file, url, content, data: arrayBuffer }); } else setPreviewFile({ file, url, content }); }
-                catch (e) { setPreviewFile({ file, url, content }); }
-            } else if (file.name.toLowerCase().endsWith('.csv')) setPreviewFile({ file, url, content: 'csv' });
-            else if (file.name.toLowerCase().endsWith('.docx') || file.mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') setPreviewFile({ file, url, content: 'docx' });
-            else if (file.name.toLowerCase().endsWith('.xlsx') || file.mimeType === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet') setPreviewFile({ file, url, content: 'xlsx' });
-            else if (file.mimeType?.startsWith('image/')) {
-                try { const exif = await exifr.parse(url); setExifData(exif || null); } catch (e) { setExifData(null); }
+                try {
+                    const res = await fetch(url);
+                    if (res.ok) {
+                        const arrayBuffer = await res.arrayBuffer();
+                        setPreviewFile({ file, url, content, data: arrayBuffer });
+                    } else {
+                        setPreviewFile({ file, url, content });
+                    }
+                } catch (e) {
+                    console.error("Could not fetch EPUB", e);
+                    setPreviewFile({ file, url, content });
+                }
+            } else if (file.name.toLowerCase().endsWith('.csv')) {
+                // CSV files
+                setPreviewFile({ file, url, content: 'csv' });
+            } else if (file.name.toLowerCase().endsWith('.docx') || file.mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
+                // Word Document
+                setPreviewFile({ file, url, content: 'docx' });
+            } else if (file.name.toLowerCase().endsWith('.xlsx') || file.mimeType === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet') {
+                // Excel Spreadsheet
+                setPreviewFile({ file, url, content: 'xlsx' });
+            } else if (file.name.toLowerCase().endsWith('.doc') || file.mimeType === 'application/msword') {
+                // Legacy Word Document - show as unavailable
+                setPreviewFile({ file, url, content: 'unsupported-legacy' });
+            } else if (file.name.toLowerCase().endsWith('.xls') || file.mimeType === 'application/vnd.ms-excel') {
+                // Legacy Excel - show as unavailable
+                setPreviewFile({ file, url, content: 'unsupported-legacy' });
+            } else if (file.mimeType?.startsWith('image/')) {
+                // Try to extract EXIF data from images
+                try {
+                    const exif = await exifr.parse(url);
+                    setExifData(exif || null);
+                } catch (e) {
+                    console.log("No EXIF data available");
+                    setExifData(null);
+                }
                 setPreviewFile({ file, url, content });
             } else {
+                // Check if it's a binary file that should be shown in hex viewer
+                const binaryExtensions = ['bin', 'dat', 'exe', 'dll', 'so', 'dylib', 'class', 'pyc'];
                 const ext = file.name.split('.').pop()?.toLowerCase();
-                if (ext && ['bin', 'dat', 'exe', 'dll', 'so', 'dylib', 'class', 'pyc'].includes(ext)) setPreviewFile({ file, url, content: 'binary' });
-                else setPreviewFile({ file, url, content });
+                if (ext && binaryExtensions.includes(ext)) {
+                    setPreviewFile({ file, url, content: 'binary' });
+                } else {
+                    setPreviewFile({ file, url, content });
+                }
             }
-        } catch (e) { const errInfo = getAwsErrorMessage(e); setActionError({ show: true, title: "预览不可用", message: errInfo.message, details: errInfo.details }); }
-        finally { setIsPreviewLoading(false); }
+        } catch (e) {
+            // If getting presigned URL fails (likely 403)
+            const errInfo = getAwsErrorMessage(e);
+            setActionError({
+                show: true,
+                title: "预览不可用",
+                message: errInfo.message,
+                details: errInfo.details,
+                docLink: errInfo.docLink
+            });
+        } finally {
+            setIsPreviewLoading(false);
+        }
     };
 
     const navigatePreview = (direction: number) => {
         if (!previewFile) return;
         const currentIndex = filteredFiles.findIndex(f => f.key === previewFile.file.key);
         let nextIndex = currentIndex + direction;
-        while (nextIndex >= 0 && nextIndex < filteredFiles.length && filteredFiles[nextIndex].isFolder) nextIndex += direction;
-        if (nextIndex >= 0 && nextIndex < filteredFiles.length) handlePreview(filteredFiles[nextIndex]);
+
+        // Skip folders in preview
+        while (nextIndex >= 0 && nextIndex < filteredFiles.length && filteredFiles[nextIndex].isFolder) {
+            nextIndex += direction;
+        }
+
+        if (nextIndex >= 0 && nextIndex < filteredFiles.length) {
+            handlePreview(filteredFiles[nextIndex]);
+        }
     };
 
     const saveEditedContent = async () => {
         if (!previewFile || !editorContent) return;
-        setProcessingState("正在保存更改...");
+        setProcessingState("Saving changes...");
         try {
             await s3.saveFileContent(previewFile.file.key, editorContent, previewFile.file.mimeType);
-            if (previewFile?.file.name.endsWith('.md')) { const html = await marked.parse(editorContent); setPreviewFile(prev => prev ? { ...prev, content: html } : null); }
-            else setPreviewFile(prev => prev ? { ...prev, content: editorContent } : null);
-            setIsEditing(false); setRefreshTrigger(p => p + 1);
-        } catch (e: any) { setActionError({ show: true, title: "保存失败", message: getAwsErrorMessage(e).message, details: getAwsErrorMessage(e).details }); }
-        finally { setProcessingState(null); }
+            if (previewFile?.file.name.endsWith('.md')) {
+                const html = await marked.parse(editorContent);
+                setPreviewFile(prev => prev ? { ...prev, content: html } : null);
+            } else {
+                setPreviewFile(prev => prev ? { ...prev, content: editorContent } : null);
+            }
+            setIsEditing(false);
+            setRefreshTrigger(p => p + 1);
+        } catch (e: any) {
+            const errInfo = getAwsErrorMessage(e);
+            setActionError({
+                show: true,
+                title: "保存失败",
+                message: errInfo.message,
+                details: errInfo.details,
+                docLink: errInfo.docLink
+            });
+        } finally {
+            setProcessingState(null);
+        }
     };
 
-    const closePreview = () => { setPreviewFile(null); setIsEditing(false); setMdTab('write'); setShowMetadata(false); setExifData(null); };
+    const closePreview = () => {
+        setPreviewFile(null);
+        setIsEditing(false);
+        setMdTab('write');
+        setShowMetadata(false);
+        setExifData(null);
+    };
 
-    const openShareModal = (file: FileObject) => { setShareModal({ show: true, file, url: null, duration: 3600 }); };
+    // Share Functionality
+    const openShareModal = (file: FileObject) => {
+        setShareModal({ show: true, file, url: null, duration: 3600 });
+    };
 
     const generateShareLink = async () => {
         if (!shareModal.file) return;
-        try { const url = await s3.getPresignedUrl(shareModal.file.key, { expiresIn: shareModal.duration }); setShareModal(prev => ({ ...prev, url })); }
-        catch (e: any) { setActionError({ show: true, title: "分享失败", message: "无法生成公开链接。", details: getAwsErrorMessage(e).details }); }
+        try {
+            const url = await s3.getPresignedUrl(shareModal.file.key, { expiresIn: shareModal.duration });
+            setShareModal(prev => ({ ...prev, url }));
+        } catch (e: any) {
+            const errInfo = getAwsErrorMessage(e);
+            setActionError({
+                show: true,
+                title: "Share Failed",
+                message: "Could not generate public link.",
+                details: errInfo.details,
+                docLink: errInfo.docLink
+            });
+        }
     };
 
+    // UI Helpers
     const getIcon = (file: FileObject, size: number = 20, className: string = "") => {
         const c = (cls: string) => `${cls} ${className}`;
+
         if (file.isFolder) return <Folder className={c("text-blue-500 fill-blue-500/10 dark:text-blue-400 dark:fill-blue-400/20")} size={size} />;
         const ext = file.name.split('.').pop()?.toLowerCase() || '';
-        const iconMap: Record<string, React.ReactNode> = {
-            'png': <ImageIcon className={c("text-purple-500")} size={size} />,
-            'jpg': <ImageIcon className={c("text-purple-500")} size={size} />, 'jpeg': <ImageIcon className={c("text-purple-500")} size={size} />,
-            'gif': <ImageIcon className={c("text-purple-500")} size={size} />, 'svg': <ImageIcon className={c("text-purple-500")} size={size} />, 'webp': <ImageIcon className={c("text-purple-500")} size={size} />,
-            'pdf': <FileText className={c("text-red-500")} size={size} />,
-            'mp4': <Video className={c("text-pink-500")} size={size} />, 'mov': <Video className={c("text-pink-500")} size={size} />,
-            'mp3': <Music className={c("text-green-500")} size={size} />, 'wav': <Music className={c("text-green-500")} size={size} />,
-            'zip': <Archive className={c("text-yellow-500")} size={size} />, 'rar': <Archive className={c("text-yellow-500")} size={size} />, '7z': <Archive className={c("text-yellow-500")} size={size} />,
-            'js': <Code className={c("text-yellow-500")} size={size} />, 'ts': <Code className={c("text-yellow-500")} size={size} />, 'tsx': <Code className={c("text-yellow-500")} size={size} />, 'jsx': <Code className={c("text-yellow-500")} size={size} />,
-            'json': <FileJson className={c("text-yellow-500")} size={size} />,
-            'csv': <FileSpreadsheet className={c("text-green-500")} size={size} />,
-            'xlsx': <FileSpreadsheet className={c("text-green-500")} size={size} />,
-            'docx': <FileText className={c("text-blue-500")} size={size} />,
-            'md': <BookOpen className={c("text-blue-500")} size={size} />,
-            'html': <Code className={c("text-orange-500")} size={size} />, 'css': <Code className={c("text-blue-500")} size={size} />,
-            'py': <Code className={c("text-blue-500")} size={size} />, 'java': <Code className={c("text-orange-500")} size={size} />, 'go': <Code className={c("text-cyan-500")} size={size} />, 'rs': <Code className={c("text-red-500")} size={size} />, 'rb': <Code className={c("text-red-500")} size={size} />,
-            'bin': <Binary className={c("text-gray-500")} size={size} />, 'dat': <Binary className={c("text-gray-500")} size={size} />, 'exe': <Binary className={c("text-gray-500")} size={size} />,
-        };
-        return iconMap[ext] || <FileText className={c("text-muted-foreground")} size={size} />;
+        if (['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp'].includes(ext)) return <ImageIcon className={c("text-purple-500 dark:text-purple-400")} size={size} />;
+        if (['mp4', 'mov', 'webm', 'avi'].includes(ext)) return <Film className={c("text-rose-500")} size={size} />;
+        if (['zip', 'rar', '7z', 'tar', 'gz'].includes(ext)) return <Package className={c("text-amber-600")} size={size} />;
+        if (['docx', 'doc'].includes(ext)) return <FileText className={c("text-blue-500 dark:text-blue-400")} size={size} />;
+        if (['xlsx', 'xls', 'csv'].includes(ext)) return <FileSpreadsheet className={c("text-green-600 dark:text-green-500")} size={size} />;
+        if (['js', 'ts', 'json', 'html', 'css', 'md', 'py', 'java'].includes(ext)) return <FileCode className={c("text-blue-500 dark:text-blue-400")} size={size} />;
+        if (['mp3', 'wav', 'ogg'].includes(ext)) return <Music className={c("text-green-500 dark:text-green-400")} size={size} />;
+        if (['epub'].includes(ext)) return <BookOpen className={c("text-emerald-500 dark:text-emerald-400")} size={size} />;
+        if (['pdf'].includes(ext)) return <FileText className={c("text-red-500 dark:text-red-400")} size={size} />;
+        return <FileIcon className={c("text-muted-foreground")} size={size} />;
     };
 
-    const isEditable = (file: FileObject) => {
-        if (file.isFolder) return false;
-        const textExts = ['.txt', '.md', '.json', '.js', '.ts', '.tsx', '.jsx', '.html', '.css', '.py', '.java', '.go', '.rs', '.rb', '.php', '.yml', '.yaml', '.xml', '.sql', '.sh', '.bash', '.env', '.config', '.toml', '.ini', '.cfg', '.log'];
-        return textExts.includes(file.name.split('.').pop() as string);
-    };
-
-    const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-        const file = e.target.files?.[0]; if (!file) return;
-        onUpload(file, currentPrefix, () => setRefreshTrigger(p => p + 1));
-        if (fileInputRef.current) fileInputRef.current.value = '';
-    };
-
-    const handleFolderUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-        const files = e.target.files; if (!files || files.length === 0) return;
-        const taskId = Math.random().toString(36).substring(7);
-        const totalFiles = files.length;
-        const startTime = Date.now();
-
-        setUploads(prev => ({ ...prev, [taskId]: { id: taskId, fileName: `文件夹 (${totalFiles} 文件)`, progress: 0, status: 'uploading', loaded: 0, total: Array.from(files).reduce((sum, f) => sum + f.size, 0) } }));
-        setShowUploads(true);
-
-        try {
-            await s3.uploadFolder(files, currentPrefix, () => {});
-            setUploads(prev => ({ ...prev, [taskId]: { ...prev[taskId], status: 'completed', progress: 100 } }));
-            setRefreshTrigger(p => p + 1);
-            setNotification(`已上传 ${totalFiles} 个文件`);
-            setTimeout(() => {
-                setUploads(current => {
-                    const allDone = (Object.values(current) as UploadTask[]).every(t => t.status !== 'uploading');
-                    if (allDone) setShowUploads(false);
-                    return current;
-                });
-            }, 3000);
-        } catch (error: any) {
-            setUploads(prev => ({ ...prev, [taskId]: { ...prev[taskId], status: 'error', error: error.message } }));
-        }
-        if (folderInputRef.current) folderInputRef.current.value = '';
-    };
-
-    const handleTouchStart = (e: React.TouchEvent) => { if (listRef.current && listRef.current.scrollTop === 0) pullStartY.current = e.touches[0].clientY; };
-    const handleTouchMove = (e: React.TouchEvent) => {
-        if (!listRef.current || listRef.current.scrollTop > 0 || pullStartY.current === 0) return;
-        const currentY = e.touches[0].clientY; const diff = currentY - pullStartY.current;
-        if (diff > 0) { setIsPulling(true); setPullDistance(Math.min(diff * 0.5, 80)); }
-    };
-    const handleTouchEnd = async () => {
-        if (isPulling && pullDistance > 50) await loadFiles();
-        setIsPulling(false); setPullDistance(0); pullStartY.current = 0;
-    };
-
-    // --- RENDER HELPERS ---
-    const renderPreviewContent = () => {
+    const renderContent = () => {
         if (!previewFile) return null;
-        const { file, url, content, data } = previewFile;
+        const isMarkdown = previewFile.file.name.endsWith('.md');
 
-        if (isEditing && content) {
+        // If editing
+        if (isEditing) {
+            if (isMarkdown && mdTab === 'preview') {
+                // Live Preview while editing
+                return (
+                    <div className="w-full h-full bg-background overflow-auto p-8 transition-colors">
+                        <div
+                            className="prose dark:prose-invert prose-sm max-w-3xl mx-auto"
+                            dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(editorPreviewHtml) }}
+                        />
+                    </div>
+                );
+            }
+
+            // Code Editor with Syntax Highlighting
+            const ext = previewFile.file.name.split('.').pop()?.toLowerCase() || '';
+            const codeExtensions = ['js', 'jsx', 'ts', 'tsx', 'py', 'json', 'html', 'css', 'java', 'cpp', 'c', 'sh', 'sql', 'yaml', 'yml', 'go', 'rust', 'php', 'rb', 'swift', 'kt'];
+            const isCodeFile = codeExtensions.includes(ext);
+
+            if (isMarkdown && mdTab === 'preview') {
+                // Markdown Preview while editing
+                return (
+                    <div className="w-full h-full bg-background overflow-auto p-8 transition-colors">
+                        <div
+                            className="prose dark:prose-invert prose-sm max-w-3xl mx-auto"
+                            dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(editorPreviewHtml) }}
+                        />
+                    </div>
+                );
+            }
+
+            // Show syntax highlighted editor for code files
+            if (isCodeFile && !isMarkdown) {
+                return (
+                    <CodeEditor
+                        value={editorContent}
+                        language={ext}
+                        onChange={setEditorContent}
+                        fileName={previewFile.file.name}
+                        readOnly={false}
+                    />
+                );
+            }
+
+            // Plain text editor with line numbers
+            const lineCount = editorContent.split('\n').length;
+            const lines = Array.from({ length: lineCount }, (_, i) => i + 1);
+
             return (
-                <div className="w-full h-full flex flex-col bg-[#1e1e1e]">
-                    <div className="bg-[#1e1e1e] border-b border-[#3e3e3e] px-4 py-2 flex items-center justify-between shrink-0">
-                        <span className="text-xs text-gray-400 font-mono">{file.name}</span>
-                        <div className="flex items-center gap-3">
-                            <span className="text-xs text-green-400 font-semibold">编辑中</span>
-                            <button onClick={saveEditedContent} className="p-1.5 rounded-md bg-green-600 hover:bg-green-700 text-white transition-colors" title="保存"><Save size={14} /></button>
-                            <button onClick={() => setIsEditing(false)} className="p-1.5 rounded-md hover:bg-secondary text-gray-400 hover:text-foreground transition-colors" title="取消"><X size={14} /></button>
+                <div className="w-full h-full flex bg-background overflow-hidden font-mono">
+                    {/* Line Numbers */}
+                    <div
+                        className="w-12 bg-muted/30 border-r border-border text-muted-foreground text-right py-4 pr-3 select-none text-sm overflow-hidden shrink-0"
+                    >
+                        <div style={{ transform: `translateY(-${editorScrollTop}px)` }}>
+                            {lines.map(l => (
+                                <div key={l} className="h-6 leading-6 text-xs opacity-50">{l}</div>
+                            ))}
                         </div>
                     </div>
-                    <CodeEditor value={editorContent} language={file.name.split('.').pop() || 'txt'} onChange={setEditorContent} fileName={file.name} />
+
+                    <textarea
+                        className="flex-1 h-full bg-background text-foreground text-sm p-4 outline-none resize-none transition-colors leading-6 whitespace-pre"
+                        value={editorContent}
+                        onChange={(e) => setEditorContent(e.target.value)}
+                        onScroll={(e) => setEditorScrollTop(e.currentTarget.scrollTop)}
+                        spellCheck={false}
+                        placeholder="输入搜索..."
+                        autoFocus
+                        wrap="off"
+                    />
                 </div>
             );
         }
 
-        if (content === 'csv') return <CSVViewer url={url} fileName={file.name} />;
-        if (content === 'docx') return <DocxPreview url={url} fileName={file.name} />;
-        if (content === 'xlsx') return <XlsxPreview url={url} fileName={file.name} />;
-        if (content === 'binary') return <HexViewer url={url} fileName={file.name} />;
-        if (file.mimeType === 'application/pdf' || file.name.endsWith('.pdf')) return <PDFViewer url={url} fileName={file.name} />;
-        if (file.mimeType === 'application/epub+zip' || file.name.endsWith('.epub')) return <EPUBViewer url={url} fileName={file.name} data={data} />;
-        if (file.mimeType?.startsWith('image/')) return <ImagePreview src={url} alt={file.name} onSwipeLeft={() => navigatePreview(-1)} onSwipeRight={() => navigatePreview(1)} onClose={closePreview} />;
-        if (file.name.endsWith('.md')) return (
-            <div className="w-full h-full flex flex-col bg-background">
-                <div className="flex items-center justify-between px-4 py-2 border-b border-border bg-secondary/20">
-                    <button onClick={() => setMdTab('write')} className={`px-3 py-1 rounded text-xs ${mdTab === 'write' ? 'bg-blue-500 text-white' : 'text-muted-foreground hover:bg-secondary'}`}>编辑</button>
-                    <button onClick={() => setMdTab('preview')} className={`px-3 py-1 rounded text-xs ${mdTab === 'preview' ? 'bg-blue-500 text-white' : 'text-muted-foreground hover:bg-secondary'}`}>预览</button>
+        // Special Content Markers (CSV, Office, Binary)
+        if (previewFile.content === 'csv') {
+            return <CSVViewer url={previewFile.url} fileName={previewFile.file.name} />;
+        }
+        if (previewFile.content === 'binary') {
+            return <HexViewer url={previewFile.url} fileName={previewFile.file.name} />;
+        }
+        if (previewFile.content === 'docx') {
+            return <DocxPreview url={previewFile.url} fileName={previewFile.file.name} />;
+        }
+        if (previewFile.content === 'xlsx') {
+            return <XlsxPreview url={previewFile.url} fileName={previewFile.file.name} />;
+        }
+        if (previewFile.content === 'unsupported-legacy') {
+            return (
+                <div className="flex flex-col items-center justify-center h-full p-4 text-center bg-background">
+                    <AlertCircle className="w-12 h-12 text-yellow-500 mb-2" />
+                    <p className="font-medium text-foreground">Legacy Format Not Supported</p>
+                    <p className="text-sm text-muted-foreground mt-1 max-w-md">
+                        This file uses an older format (.doc, .xls, .ppt). For preview support, please convert to modern Office format (.docx, .xlsx, .pptx).
+                    </p>
+                    <button 
+                        onClick={() => handleDownload(previewFile.file)} 
+                        className="mt-4 px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors flex items-center gap-2"
+                    >
+                        <Download size={16} /> Download File
+                    </button>
                 </div>
-                <div className="flex-1 overflow-auto">
-                    {mdTab === 'write' ? (
-                        <textarea className="w-full h-full p-4 font-mono text-sm resize-none bg-background border-none focus:outline-none" value={editorContent || ''} readOnly />
+            );
+        }
+
+        // Not editing (View Mode)
+        if (previewFile.content !== undefined) {
+            if (isMarkdown) {
+                // Markdown View Mode
+                return (
+                    <div className="w-full h-full bg-background overflow-auto p-8 transition-colors">
+                        <div
+                            className="prose dark:prose-invert prose-sm max-w-3xl mx-auto"
+                            dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(previewFile.content) }}
+                        />
+                    </div>
+                );
+            }
+            // Code View Mode with Syntax Highlighting
+            const ext = previewFile.file.name.split('.').pop()?.toLowerCase() || '';
+            const codeExtensions = ['js', 'jsx', 'ts', 'tsx', 'py', 'json', 'html', 'css', 'java', 'cpp', 'c', 'sh', 'sql', 'yaml', 'yml', 'go', 'rust', 'php', 'rb', 'swift', 'kt'];
+            
+            if (codeExtensions.includes(ext)) {
+                return <CodeViewer code={previewFile.content} language={ext} fileName={previewFile.file.name} />;
+            }
+            
+            // Plain Text View Mode
+            return (
+                <div className="w-full h-full bg-background overflow-auto p-4 transition-colors">
+                    <pre className="font-mono text-sm text-foreground whitespace-pre-wrap">{previewFile.content}</pre>
+                </div>
+            );
+        }
+
+        // Media/Binary Preview
+
+
+        return (
+            <div className="w-full h-full flex items-center justify-center p-4 bg-secondary/10 transition-colors">
+                {previewFile.file.mimeType?.startsWith('image') ? (
+                    <ImagePreview
+                        src={previewFile.url}
+                        alt="Preview"
+                        onSwipeLeft={() => navigatePreview(1)}
+                        onSwipeRight={() => navigatePreview(-1)}
+                        onClose={closePreview}
+                    />
+                ) : previewFile.file.mimeType?.startsWith('video') ? (
+                    <video src={previewFile.url} controls className="max-w-full max-h-full shadow-2xl rounded-sm" />
+                ) : previewFile.file.mimeType?.startsWith('audio') ? (
+                    <audio src={previewFile.url} controls className="w-full max-w-md" />
+                ) : previewFile.file.mimeType === 'application/pdf' || previewFile.file.name.endsWith('.pdf') ? (
+                    isMobile ? (
+                        <PDFViewer url={previewFile.url} fileName={previewFile.file.name} />
                     ) : (
-                        <div className="prose prose-sm max-w-none p-4" dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(content || '') }} />
-                    )}
-                </div>
+                        <iframe
+                            src={previewFile.url}
+                            className="w-full h-full border-0 rounded-sm shadow-2xl"
+                            title="PDF Preview"
+                        />
+                    )
+                ) : previewFile.file.mimeType === 'application/epub+zip' || previewFile.file.name.endsWith('.epub') ? (
+                    <EPUBViewer url={previewFile.url} data={previewFile.data} fileName={previewFile.file.name} />
+                ) : (
+                    <div className="text-center text-muted-foreground">
+                        <FileIcon size={64} className="mx-auto mb-4 opacity-20" />
+                        <p className="mb-2">{previewFile.file.name}</p>
+                        <p className="text-xs mb-4">Preview not available for this file type</p>
+                        <button onClick={() => handleDownload(previewFile.file)} className="mt-4 text-blue-500 hover:underline text-sm">Download File</button>
+                    </div>
+                )}
             </div>
         );
-        if (content) return (
-            <div className="w-full h-full flex flex-col bg-[#2d2d2d] overflow-auto">
-                <div className="sticky top-0 bg-[#1e1e1e] border-b border-[#3e3e3e] px-4 py-2 flex items-center justify-between z-10">
-                    <span className="text-xs text-gray-400 font-mono">{file.name}</span>
-                    <span className="text-xs text-gray-500 font-mono uppercase">{file.name.split('.').pop()}</span>
-                </div>
-                <pre className="!m-0 !bg-transparent p-4 text-sm font-mono text-gray-300 whitespace-pre-wrap break-all">{content}</pre>
-            </div>
-        );
-        return null;
     };
 
     return (
-        <div className="flex flex-col h-full w-full bg-background" onTouchStart={handleTouchStart} onTouchMove={handleTouchMove} onTouchEnd={handleTouchEnd}>
-            <input type="file" ref={fileInputRef} onChange={handleFileUpload} className="hidden" />
-
-            {/* Toolbar */}
-            <div className="flex items-center justify-between px-3 md:px-4 py-2 border-b border-border bg-background/50 backdrop-blur-sm shrink-0" style={{ paddingTop: `${Math.max(8, safeArea.top + 8)}px` }}>
-                <div className="flex items-center gap-2 min-w-0">
-                    <button onClick={handleUp} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors" title="返回"><ArrowLeft size={16} /></button>
-                    <div className="flex items-center gap-1 text-muted-foreground overflow-hidden min-w-0">
-                        <Database size={14} className="shrink-0" />
-                        <span className="font-semibold text-foreground cursor-pointer hover:underline truncate">{bucketName}</span>
-                        {currentPrefix.split('/').filter(Boolean).map((part, idx) => (
-                            <React.Fragment key={idx}>
-                                <ChevronRight size={12} className="shrink-0" />
-                                <span className="cursor-pointer hover:underline truncate" onClick={() => setCurrentPrefix(currentPrefix.split('/').filter(Boolean).slice(0, idx + 1).join('/') + '/')}>{part}</span>
-                            </React.Fragment>
-                        ))}
-                    </div>
-                </div>
-                <div className="flex items-center gap-2">
-                    <button onClick={() => setViewMode(v => v === ViewMode.LIST ? ViewMode.GRID : ViewMode.LIST)} className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors" title={viewMode === ViewMode.LIST ? '网格视图' : '列表视图'}>{viewMode === ViewMode.LIST ? <Grid size={14} /> : <List size={14} />}</button>
-                    <div className="h-4 w-px bg-border mx-1 hidden sm:block"></div>
-                    <button onClick={() => fileInputRef.current?.click()} className="bg-blue-500 text-white px-3 py-1.5 rounded-md text-xs font-medium hover:bg-blue-600 transition-colors flex items-center gap-1"><UploadCloud size={12} /><span className="hidden sm:inline">上传</span></button>
-                </div>
-            </div>
-
-            {/* Search + Action Bar */}
-            <div className="flex items-center gap-2 px-3 md:px-4 py-2 border-b border-border bg-background shrink-0">
-                <div className="flex-1 relative">
-                    <Search className="absolute left-3 top-2.5 text-muted-foreground w-4 h-4" />
-                    <input type="text" placeholder="搜索文件..." className="w-full bg-secondary/50 border border-border/50 focus:border-border rounded-md pl-10 pr-3 py-2 text-sm outline-none transition-all" value={searchInput} onChange={(e) => setSearchInput(e.target.value)} />
-                </div>
-                <button onClick={toggleSelectionMode} className="p-2 rounded-md text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors" title="选择模式"><CheckSquare size={16} /></button>
-                <button onClick={() => setCreateFolderModal(prev => ({ ...prev, show: true }))} className="p-2 rounded-md text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors" title="新建文件夹"><FolderPlus size={16} /></button>
-                <button onClick={() => setCreateFileModal(prev => ({ ...prev, show: true }))} className="p-2 rounded-md text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors" title="新建文件"><FilePlus size={16} /></button>
-                <button onClick={loadFiles} className="p-2 rounded-md text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors" title="刷新"><RefreshCw size={16} className={loading ? "animate-spin" : ""} /></button>
-            </div>
-
-            {/* Sort Bar */}
-            <div className="flex items-center gap-1 px-3 md:px-4 py-1.5 border-b border-border bg-background/50 shrink-0">
-                <span className="text-xs text-muted-foreground mr-1">排序</span>
-                <button onClick={() => { if (sortBy === 'name') { setSortDirection(d => d === 'asc' ? 'desc' : 'asc'); } else { setSortBy('name'); setSortDirection('asc'); } }} className={`flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium transition-colors ${sortBy === 'name' ? 'bg-blue-500/10 text-blue-500' : 'text-muted-foreground hover:bg-secondary'}`}>
-                    名称 {sortBy === 'name' ? (sortDirection === 'asc' ? <ArrowUp size={12} /> : <ArrowDown size={12} />) : <ArrowUpDown size={12} />}
-                </button>
-                <button onClick={() => { if (sortBy === 'size') { setSortDirection(d => d === 'asc' ? 'desc' : 'asc'); } else { setSortBy('size'); setSortDirection('asc'); } }} className={`flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium transition-colors ${sortBy === 'size' ? 'bg-blue-500/10 text-blue-500' : 'text-muted-foreground hover:bg-secondary'}`}>
-                    大小 {sortBy === 'size' ? (sortDirection === 'asc' ? <ArrowUp size={12} /> : <ArrowDown size={12} />) : <ArrowUpDown size={12} />}
-                </button>
-                <button onClick={() => { if (sortBy === 'date') { setSortDirection(d => d === 'asc' ? 'desc' : 'asc'); } else { setSortBy('date'); setSortDirection('asc'); } }} className={`flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium transition-colors ${sortBy === 'date' ? 'bg-blue-500/10 text-blue-500' : 'text-muted-foreground hover:bg-secondary'}`}>
-                    日期 {sortBy === 'date' ? (sortDirection === 'asc' ? <ArrowUp size={12} /> : <ArrowDown size={12} />) : <ArrowUpDown size={12} />}
-                </button>
-            </div>
-
-            {/* Bulk Action Bar */}
-            {selectionMode && (
-                <div className="flex items-center justify-between px-3 md:px-4 py-2 bg-blue-500/10 border-b border-blue-500/20 shrink-0">
-                    <span className="text-sm text-blue-500 font-medium">{selectedKeys.size > 0 ? `${selectedKeys.size} 项已选择` : '选择模式'}</span>
-                    <div className="flex items-center gap-2">
-                        {selectedKeys.size === 0 && <button onClick={handleSelectAll} className="px-3 py-1.5 rounded-md bg-secondary text-foreground text-xs font-medium hover:bg-secondary/80 transition-colors flex items-center gap-1"><Check size={12} /> 全选</button>}
-                        {selectedKeys.size > 0 && <button onClick={handleBulkDownload} className="px-3 py-1.5 rounded-md bg-blue-500 text-white text-xs font-medium hover:bg-blue-600 transition-colors flex items-center gap-1"><Download size={12} /> 下载</button>}
-                        {selectedKeys.size > 0 && <button onClick={handleBulkCopy} className="px-3 py-1.5 rounded-md bg-secondary text-foreground text-xs font-medium hover:bg-secondary/80 transition-colors flex items-center gap-1"><Copy size={12} /> 复制</button>}
-                        {selectedKeys.size > 0 && <button onClick={openMoveModal} className="px-3 py-1.5 rounded-md bg-secondary text-foreground text-xs font-medium hover:bg-secondary/80 transition-colors flex items-center gap-1"><Move size={12} /> 移动</button>}
-                        {selectedKeys.size > 0 && <button onClick={() => setDeleteConfirmation({ show: true, isBulk: true })} className="px-3 py-1.5 rounded-md bg-destructive text-destructive-foreground text-xs font-medium hover:opacity-90 transition-opacity flex items-center gap-1"><Trash2 size={12} /> 删除</button>}
-                        <button onClick={() => { setSelectionMode(false); setSelectedKeys(new Set()); }} className="px-3 py-1.5 rounded-md bg-secondary text-foreground text-xs font-medium hover:bg-secondary/80 transition-colors">取消</button>
+        <div
+            className="flex flex-col h-full relative bg-background select-none transition-colors duration-300"
+            {...edgeSwipeHandlers}
+        >
+            {/* Edge Swipe Back Indicator */}
+            {isEdgeSwipe && (
+                <div className="fixed left-0 top-0 bottom-0 z-[200] flex items-center justify-start pl-4 pointer-events-none bg-gradient-to-r from-black/10 to-transparent w-24 transition-opacity" style={{ opacity: swipeProgress }}>
+                    <div className="bg-background/80 backdrop-blur-md rounded-full p-3 shadow-lg border border-border transform transition-transform" style={{ transform: `scale(${0.5 + swipeProgress * 0.5})` }}>
+                        <ArrowLeft size={24} className="text-foreground" />
                     </div>
                 </div>
             )}
 
-            {/* Pull Refresh Spinner */}
-            {isPulling && pullDistance > 50 && (
-                <div className="absolute top-16 left-0 right-0 flex justify-center z-10"><Loader2 className="w-5 h-5 text-blue-500 animate-spin" /></div>
-            )}
-
-            {/* File List */}
-            <div ref={listRef} className="flex-1 overflow-y-auto custom-scrollbar relative z-10 bg-background transition-transform duration-200 ease-out" style={{ transform: isPulling ? `translateY(${pullDistance}px)` : 'none' }}>
-                {loading && files.length === 0 && (
-                    <div className="flex flex-col items-center justify-center py-12 text-muted-foreground"><Loader2 className="w-6 h-6 animate-spin mb-2 opacity-50" /><span className="text-sm">正在加载文件...</span></div>
-                )}
-                {viewError && (
-                    <div className="p-4 bg-destructive/10 rounded-md border border-destructive/20 mx-3 mt-3">
-                        <div className="flex items-center gap-2 mb-1"><AlertCircle className="w-4 h-4 text-destructive" /><span className="text-sm text-destructive font-bold">{viewError.title}</span></div>
-                        <p className="text-xs text-destructive/80 pl-6 mb-2">{viewError.message}</p>
-                        <button onClick={loadFiles} className="w-full text-xs bg-background/50 hover:bg-background px-3 py-2 rounded text-destructive transition-colors border border-destructive/20">重试</button>
-                    </div>
-                )}
-                {!loading && !viewError && filteredFiles.length === 0 && (
-                    <div className="flex flex-col items-center justify-center py-12 text-muted-foreground"><Folder size={32} className="opacity-50 mb-2" /><p className="text-sm">此文件夹为空</p></div>
-                )}
-                {!loading && !viewError && (
-                    viewMode === ViewMode.LIST ? (
-                        <div className="relative pb-4">
-                            <div style={{ height: `${virtualizer.getTotalSize()}px` }} className="relative">
-                                {virtualizer.getVirtualItems().map(virtualRow => {
-                                    const file = filteredFiles[virtualRow.index];
-                                    if (!file) return null;
-                                    return (
-                                        <div
-                                            key={file.key}
-                                            data-index={virtualRow.index}
-                                            ref={virtualizer.measureElement}
-                                            style={{ position: 'absolute', top: 0, left: 0, width: '100%', transform: `translateY(${virtualRow.start}px)` }}
-                                            draggable={true}
-                                            onDragStart={(e) => handleDragStart(e, file)}
-                                            onDragOver={(e) => handleDragOver(e, file)}
-                                            onDragLeave={handleDragLeave}
-                                            onDrop={(e) => handleDrop(e, file)}
-                                            onClick={(e) => handleItemClick(file, e)}
-                                            onContextMenu={(e) => handleContextMenu(file, e)}
-                                            onTouchStart={(e) => { if (!selectionMode) handleLongPressStart(file, e); }}
-                                            onTouchEnd={handleLongPressEnd}
-                                            onTouchCancel={handleLongPressEnd}
-                                            className={`group flex items-center gap-3 px-3 py-2.5 rounded-lg cursor-pointer transition-all text-sm
-                                                ${selectedKeys.has(file.key) ? 'bg-blue-500/10 text-blue-500' : 'text-foreground hover:bg-secondary/50'}
-                                            `}
-                                        >
-                                            <div className="flex items-center justify-center shrink-0">{getIcon(file, 20)}</div>
-                                            <div className="flex-1 min-w-0">
-                                                <span className="truncate">{file.name}</span>
-                                                {!file.isFolder && file.mimeType && <span className="text-[10px] text-muted-foreground ml-1">{file.mimeType}</span>}
-                                            </div>
-                                            {!file.isFolder && <span className="text-xs text-muted-foreground shrink-0">{formatBytes(file.size)}</span>}
-                                            <span className="text-xs text-muted-foreground shrink-0 hidden sm:inline">{new Date(file.lastModified).toLocaleDateString()}</span>
-                                            <button className="p-1 rounded-md opacity-0 group-hover:opacity-100 transition-all text-muted-foreground hover:text-foreground hover:bg-secondary" title="更多操作"><MoreVertical size={14} /></button>
-                                        </div>
-                                    );
-                                })}
-                            </div>
+            {/* Drag Preview */}
+            {dragState.isDragging && dragState.draggedFile && (
+                <div
+                    className="fixed z-[250] pointer-events-none"
+                    style={{
+                        left: `${dragState.dragPosition.x}px`,
+                        top: `${dragState.dragPosition.y}px`,
+                        transform: 'translate(-50%, -50%)'
+                    }}
+                >
+                    <div className="bg-background/90 backdrop-blur-md border-2 border-primary rounded-xl p-3 shadow-2xl flex items-center gap-3 animate-pulse">
+                        <div className="text-primary">
+                            {getIcon(dragState.draggedFile, 24)}
                         </div>
-                    ) : (
-                        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3 p-3 pb-4">
-                            {filteredFiles.map(file => (
-                                <div
-                                    key={file.key}
-                                    draggable={true}
-                                    onDragStart={(e) => handleDragStart(e, file)}
-                                    onDragOver={(e) => handleDragOver(e, file)}
-                                    onDragLeave={handleDragLeave}
-                                    onDrop={(e) => handleDrop(e, file)}
-                                    onClick={(e) => handleItemClick(file, e)}
-                                    onContextMenu={(e) => handleContextMenu(file, e)}
-                                    onTouchStart={(e) => { if (!selectionMode) handleLongPressStart(file, e); }}
-                                    onTouchEnd={handleLongPressEnd}
-                                    onTouchCancel={handleLongPressEnd}
-                                    className={`aspect-[4/3.2] rounded-xl border p-3 flex flex-col items-center justify-center gap-2 cursor-pointer transition-all
-                                        ${selectedKeys.has(file.key) ? 'bg-blue-500/10 border-blue-500/50 shadow-[0_0_30px_-10px_rgba(59,130,246,0.3)]' : 'bg-card/50 border-border hover:border-foreground/20 hover:shadow-sm'}
-                                    `}
-                                >
-                                    <div className="flex items-center justify-center">{getIcon(file, 32)}</div>
-                                    <span className="text-xs text-foreground text-center truncate w-full">{file.name}</span>
-                                    {!file.isFolder && <span className="text-[10px] text-muted-foreground">{formatBytes(file.size)}</span>}
-                                </div>
-                            ))}
-                        </div>
-                    )
-                )}
-            </div>
-
-            {/* Processing State Overlay */}
-            {processingState && (
-                <div className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center z-[300]"><div className="bg-card border border-border rounded-xl p-6 shadow-2xl flex items-center gap-3"><Loader2 className="w-5 h-5 animate-spin text-blue-500" /><span className="text-sm text-foreground">{processingState}</span></div></div>
+                        <span className="font-medium text-sm max-w-[200px] truncate">
+                            {dragState.draggedFile.name}
+                        </span>
+                    </div>
+                </div>
             )}
-
-            {/* Notification Toast */}
+            {/* Toast Notification */}
             {notification && (
-                <div className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-foreground text-background px-4 py-2 rounded-lg shadow-xl text-sm font-medium z-[300] animate-in slide-in-from-bottom-4 fade-in">{notification}</div>
-            )}
-
-            {/* Context Menu */}
-            {contextMenu.show && contextMenu.file && (
-                <div className="fixed bg-card border border-border rounded-lg shadow-2xl overflow-hidden z-[250] min-w-[160px]" style={{ left: contextMenu.x, top: contextMenu.y }} onMouseLeave={() => setContextMenu(prev => ({ ...prev, show: false }))}>
-                    <button className="w-full px-4 py-2 text-sm text-left hover:bg-secondary flex items-center gap-2" onClick={() => { setContextMenu(prev => ({ ...prev, show: false })); if (contextMenu.file?.isFolder) handleNavigate(contextMenu.file.key); else handlePreview(contextMenu.file); }}><Eye size={14} /> 打开</button>
-                    <button className="w-full px-4 py-2 text-sm text-left hover:bg-secondary flex items-center gap-2" onClick={() => { setContextMenu(prev => ({ ...prev, show: false })); handleDownload(contextMenu.file!); }}><Download size={14} /> 下载</button>
-                    <button className="w-full px-4 py-2 text-sm text-left hover:bg-secondary flex items-center gap-2" onClick={() => { setContextMenu(prev => ({ ...prev, show: false })); handleCopyS3Path(contextMenu.file!); }}><Copy size={14} /> 复制路径</button>
-                    <button className="w-full px-4 py-2 text-sm text-left hover:bg-secondary flex items-center gap-2" onClick={() => { setContextMenu(prev => ({ ...prev, show: false })); handleCopyFile(contextMenu.file!); }}><Copy size={14} /> 复制文件</button>
-                    <button className="w-full px-4 py-2 text-sm text-left hover:bg-secondary flex items-center gap-2" onClick={() => { setContextMenu(prev => ({ ...prev, show: false })); openShareModal(contextMenu.file!); }}><Share2 size={14} /> 分享</button>
-                    {isEditable(contextMenu.file!) && (
-                        <button className="w-full px-4 py-2 text-sm text-left hover:bg-secondary flex items-center gap-2" onClick={() => { setContextMenu(prev => ({ ...prev, show: false })); handlePreview(contextMenu.file!); setIsEditing(true); }}><Edit2 size={14} /> 编辑</button>
-                    )}
-                    <div className="h-px bg-border"></div>
-                    <button className="w-full px-4 py-2 text-sm text-left hover:bg-secondary flex items-center gap-2" onClick={() => { setContextMenu(prev => ({ ...prev, show: false })); openRenameModal(contextMenu.file!); }}><PenTool size={14} /> 重命名</button>
-                    <button className="w-full px-4 py-2 text-sm text-left hover:bg-secondary flex items-center gap-2" onClick={() => { setContextMenu(prev => ({ ...prev, show: false })); setMoveModal(prev => ({ ...prev, show: true })); setSelectedKeys(new Set([contextMenu.file!.key])); }}><Move size={14} /> 移动</button>
-                    <button className="w-full px-4 py-2 text-sm text-left hover:bg-destructive/10 text-destructive flex items-center gap-2" onClick={() => { setContextMenu(prev => ({ ...prev, show: false })); setDeleteConfirmation({ show: true }); }}><Trash2 size={14} /> 删除</button>
-                </div>
-            )}
-
-            {/* Preview Modal */}
-            {previewFile && (
-                <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-[200]" onClick={closePreview}>
-                    <div className="w-full h-full md:max-w-6xl md:max-h-[90vh] md:rounded-xl overflow-hidden bg-background relative flex" onClick={e => e.stopPropagation()}>
-                        <div className="flex-1 relative overflow-hidden">
-                            <div className="absolute top-3 right-3 z-10 flex items-center gap-2">
-                                {previewFile.file.name.endsWith('.md') && <button onClick={() => setMdTab(mdTab === 'write' ? 'preview' : 'write')} className="p-2 rounded-full bg-black/50 text-white hover:bg-black/70 transition-colors" title="切换预览"><BookOpen size={16} /></button>}
-                                {!previewFile.file.isFolder && <button onClick={() => handleDownload(previewFile.file)} className="p-2 rounded-full bg-black/50 text-white hover:bg-black/70 transition-colors" title="下载"><Download size={16} /></button>}
-                                <button onClick={closePreview} className="p-2 rounded-full bg-black/50 text-white hover:bg-black/70 transition-colors" title="关闭"><X size={16} /></button>
-                            </div>
-                            {isPreviewLoading ? (
-                                <div className="flex items-center justify-center h-full"><Loader2 className="w-8 h-8 animate-spin text-blue-500" /></div>
-                            ) : renderPreviewContent()}
-                        </div>
-                        {/* EXIF Data Side Panel */}
-                        {exifData && (
-                            <div className="w-80 border-l border-border bg-background flex flex-col overflow-y-auto custom-scrollbar shrink-0">
-                                <div className="p-4 border-b border-border">
-                                    <div className="flex items-center justify-between">
-                                        <h3 className="font-semibold text-sm text-foreground">EXIF 信息</h3>
-                                        <button onClick={() => setShowMetadata(!showMetadata)} className="p-1 rounded hover:bg-secondary text-muted-foreground"><Info size={14} /></button>
-                                    </div>
-                                    <p className="text-xs text-muted-foreground mt-1">{previewFile.file.name}</p>
-                                </div>
-                                <div className="p-4 space-y-4">
-                                    {exifData.Make && (
-                                        <div>
-                                            <span className="text-[10px] text-muted-foreground uppercase tracking-wider">相机品牌</span>
-                                            <p className="text-sm text-foreground mt-0.5">{exifData.Make}</p>
-                                        </div>
-                                    )}
-                                    {exifData.Model && (
-                                        <div>
-                                            <span className="text-[10px] text-muted-foreground uppercase tracking-wider">相机型号</span>
-                                            <p className="text-sm text-foreground mt-0.5">{exifData.Model}</p>
-                                        </div>
-                                    )}
-                                    {exifData.DateTimeOriginal && (
-                                        <div>
-                                            <span className="text-[10px] text-muted-foreground uppercase tracking-wider">拍摄时间</span>
-                                            <p className="text-sm text-foreground mt-0.5">{exifData.DateTimeOriginal}</p>
-                                        </div>
-                                    )}
-                                    {exifData.ApertureValue && (
-                                        <div>
-                                            <span className="text-[10px] text-muted-foreground uppercase tracking-wider">光圈</span>
-                                            <p className="text-sm text-foreground mt-0.5">{exifData.ApertureValue}</p>
-                                        </div>
-                                    )}
-                                    {exifData.FocalLength && (
-                                        <div>
-                                            <span className="text-[10px] text-muted-foreground uppercase tracking-wider">焦距</span>
-                                            <p className="text-sm text-foreground mt-0.5">{exifData.FocalLength}mm</p>
-                                        </div>
-                                    )}
-                                    {exifData.ISOSpeedRatings && (
-                                        <div>
-                                            <span className="text-[10px] text-muted-foreground uppercase tracking-wider">ISO</span>
-                                            <p className="text-sm text-foreground mt-0.5">{exifData.ISOSpeedRatings}</p>
-                                        </div>
-                                    )}
-                                    {exifData.ShutterSpeedValue && (
-                                        <div>
-                                            <span className="text-[10px] text-muted-foreground uppercase tracking-wider">快门速度</span>
-                                            <p className="text-sm text-foreground mt-0.5">{exifData.ShutterSpeedValue}s</p>
-                                        </div>
-                                    )}
-                                    {exifData.PixelXDimension && exifData.PixelYDimension && (
-                                        <div>
-                                            <span className="text-[10px] text-muted-foreground uppercase tracking-wider">分辨率</span>
-                                            <p className="text-sm text-foreground mt-0.5">{exifData.PixelXDimension} × {exifData.PixelYDimension}</p>
-                                        </div>
-                                    )}
-                                    {exifData.GPS && exifData.GPS.GPSLatitude && exifData.GPS.GPSLongitude && (
-                                        <div>
-                                            <span className="text-[10px] text-muted-foreground uppercase tracking-wider">GPS 位置</span>
-                                            <p className="text-xs text-foreground mt-0.5 break-all">{JSON.stringify(exifData.GPS)}</p>
-                                        </div>
-                                    )}
-                                    {exifData.Orientation && (
-                                        <div>
-                                            <span className="text-[10px] text-muted-foreground uppercase tracking-wider">方向</span>
-                                            <p className="text-sm text-foreground mt-0.5">{exifData.Orientation}</p>
-                                        </div>
-                                    )}
-                                    {exifData.WhiteBalance && (
-                                        <div>
-                                            <span className="text-[10px] text-muted-foreground uppercase tracking-wider">白平衡</span>
-                                            <p className="text-sm text-foreground mt-0.5">{exifData.WhiteBalance}</p>
-                                        </div>
-                                    )}
-                                    {exifData.Flash && (
-                                        <div>
-                                            <span className="text-[10px] text-muted-foreground uppercase tracking-wider">闪光灯</span>
-                                            <p className="text-sm text-foreground mt-0.5">{exifData.Flash ? '开启' : '关闭'}</p>
-                                        </div>
-                                    )}
-                                </div>
-                            </div>
-                        )}
+                <div className="fixed top-16 left-1/2 -translate-x-1/2 z-[150] animate-in slide-in-from-top-4 fade-in duration-300">
+                    <div className="bg-foreground text-background px-4 py-2 rounded-full shadow-lg flex items-center gap-2 text-sm font-medium">
+                        <CheckCircle2 size={16} className="text-green-500" />
+                        {notification}
                     </div>
                 </div>
             )}
 
-            {/* Create Folder Modal */}
-            {createFolderModal.show && (
-                <div className="fixed inset-0 z-[250] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={() => setCreateFolderModal(prev => ({ ...prev, show: false }))}>
-                    <div className="bg-card border border-border rounded-lg shadow-xl max-w-md w-full p-6" onClick={e => e.stopPropagation()}>
-                        <h3 className="text-lg font-semibold mb-4">新建文件夹</h3>
-                        <input type="text" autoFocus placeholder="文件夹名称" className="w-full bg-secondary border border-input rounded-md px-3 py-2 text-sm focus:border-foreground outline-none transition-colors" value={createFolderModal.folderName} onChange={(e) => setCreateFolderModal(prev => ({ ...prev, folderName: e.target.value }))} />
-                        <div className="flex justify-end gap-2 mt-4">
-                            <button onClick={() => setCreateFolderModal(prev => ({ ...prev, show: false }))} className="px-4 py-2 rounded-md text-sm font-medium hover:bg-secondary transition-colors">取消</button>
-                            <button onClick={handleCreateFolder} disabled={!createFolderModal.folderName} className="px-4 py-2 rounded-md text-sm font-medium bg-blue-500 text-white hover:bg-blue-600 transition-colors disabled:opacity-70">创建</button>
-                        </div>
-                    </div>
-                </div>
-            )}
-
-            {/* Create File Modal */}
-            {createFileModal.show && (
-                <div className="fixed inset-0 z-[250] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={() => setCreateFileModal(prev => ({ ...prev, show: false }))}>
-                    <div className="bg-card border border-border rounded-lg shadow-xl max-w-lg w-full p-6" onClick={e => e.stopPropagation()}>
-                        <h3 className="text-lg font-semibold mb-4">新建文件</h3>
-                        <div className="space-y-3">
-                            <input type="text" autoFocus placeholder="文件名（例如 hello.txt）" className="w-full bg-secondary border border-input rounded-md px-3 py-2 text-sm focus:border-foreground outline-none transition-colors" value={createFileModal.filename} onChange={(e) => setCreateFileModal(prev => ({ ...prev, filename: e.target.value }))} />
-                            <textarea placeholder="文件内容（可选）" rows={6} className="w-full bg-secondary border border-input rounded-md px-3 py-2 text-sm font-mono focus:border-foreground outline-none transition-colors resize-none" value={createFileModal.content} onChange={(e) => setCreateFileModal(prev => ({ ...prev, content: e.target.value }))} />
-                        </div>
-                        <div className="flex justify-end gap-2 mt-4">
-                            <button onClick={() => setCreateFileModal(prev => ({ ...prev, show: false }))} className="px-4 py-2 rounded-md text-sm font-medium hover:bg-secondary transition-colors">取消</button>
-                            <button onClick={handleCreateFile} disabled={!createFileModal.filename} className="px-4 py-2 rounded-md text-sm font-medium bg-blue-500 text-white hover:bg-blue-600 transition-colors disabled:opacity-70">创建</button>
-                        </div>
-                    </div>
-                </div>
-            )}
-
-            {/* Rename Modal */}
-            {renameModal.show && (
-                <div className="fixed inset-0 z-[250] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={() => setRenameModal(prev => ({ ...prev, show: false }))}>
-                    <div className="bg-card border border-border rounded-lg shadow-xl max-w-md w-full p-6" onClick={e => e.stopPropagation()}>
-                        <h3 className="text-lg font-semibold mb-4">重命名</h3>
-                        <input type="text" autoFocus className="w-full bg-secondary border border-input rounded-md px-3 py-2 text-sm focus:border-foreground outline-none transition-colors" value={renameModal.newName} onChange={(e) => setRenameModal(prev => ({ ...prev, newName: e.target.value }))} onKeyDown={(e) => e.key === 'Enter' && handleRename()} />
-                        <div className="flex justify-end gap-2 mt-4">
-                            <button onClick={() => setRenameModal(prev => ({ ...prev, show: false }))} className="px-4 py-2 rounded-md text-sm font-medium hover:bg-secondary transition-colors">取消</button>
-                            <button onClick={handleRename} disabled={!renameModal.newName} className="px-4 py-2 rounded-md text-sm font-medium bg-blue-500 text-white hover:bg-blue-600 transition-colors disabled:opacity-70">重命名</button>
-                        </div>
-                    </div>
-                </div>
-            )}
-
-            {/* Share Modal */}
-            {shareModal.show && (
-                <div className="fixed inset-0 z-[250] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={() => setShareModal(prev => ({ ...prev, show: false }))}>
-                    <div className="bg-card border border-border rounded-lg shadow-xl max-w-md w-full p-6" onClick={e => e.stopPropagation()}>
-                        <div className="flex justify-between items-center mb-4"><h3 className="text-lg font-semibold">分享链接</h3><button onClick={() => setShareModal(prev => ({ ...prev, show: false }))} className="text-muted-foreground hover:text-foreground"><X size={18} /></button></div>
-                        <p className="text-sm text-muted-foreground mb-3">为 <span className="font-medium text-foreground">{shareModal.file?.name}</span> 生成预签名 URL。</p>
-                        <div className="mb-3"><label className="text-xs font-medium text-muted-foreground mb-1 block">链接有效期</label><select className="w-full bg-secondary border border-input rounded-md px-3 py-2 text-sm focus:border-foreground outline-none transition-colors" value={shareModal.duration} onChange={(e) => setShareModal(prev => ({ ...prev, duration: parseInt(e.target.value) }))}><option value={3600}>1 小时</option><option value={86400}>1 天</option><option value={604800}>7 天</option></select></div>
-                        <button onClick={generateShareLink} className="w-full bg-blue-500 text-white px-4 py-2 rounded-md text-sm font-medium hover:bg-blue-600 transition-colors mb-3">生成链接</button>
-                        {shareModal.url && (
-                            <div className="space-y-2">
-                                <input type="text" readOnly className="w-full bg-secondary border border-input rounded-md px-3 py-2 text-xs font-mono text-muted-foreground" value={shareModal.url} />
-                                <button onClick={() => navigator.clipboard.writeText(shareModal.url!)} className="w-full bg-secondary text-foreground px-4 py-2 rounded-md text-sm font-medium hover:bg-secondary/80 transition-colors">复制链接</button>
-                            </div>
-                        )}
-                    </div>
-                </div>
-            )}
-
-            {/* Delete Confirmation Modal */}
-            {deleteConfirmation.show && (
-                <div className="fixed inset-0 z-[250] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={() => setDeleteConfirmation({ show: false })}>
-                    <div className="bg-card border border-border rounded-lg shadow-xl max-w-md w-full p-6" onClick={e => e.stopPropagation()}>
-                        <h3 className="text-lg font-semibold text-destructive mb-3">确认删除</h3>
-                        <p className="text-sm text-muted-foreground mb-4">{deleteConfirmation.isBulk ? `确定要删除 ${selectedKeys.size} 项吗？此操作无法撤销。` : '确定要删除此项吗？此操作无法撤销。'}</p>
-                        <div className="flex justify-end gap-2">
-                            <button onClick={() => setDeleteConfirmation({ show: false })} className="px-4 py-2 rounded-md text-sm font-medium hover:bg-secondary transition-colors">取消</button>
-                            <button onClick={handleBulkDelete} className="px-4 py-2 rounded-md text-sm font-medium bg-destructive text-destructive-foreground hover:opacity-90 transition-opacity">删除</button>
-                        </div>
+            {/* Processing Overlay */}
+            {processingState && (
+                <div className="absolute inset-0 z-[60] bg-background/50 backdrop-blur-sm flex items-center justify-center animate-in fade-in duration-200">
+                    <div className="bg-card border border-border px-6 py-4 rounded-lg shadow-xl flex items-center gap-3">
+                        <Loader2 className="w-5 h-5 animate-spin text-primary" />
+                        <span className="font-medium">{processingState}</span>
                     </div>
                 </div>
             )}
 
             {/* Action Error Modal */}
             {actionError?.show && (
-                <div className="fixed inset-0 z-[260] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={() => setActionError(null)}>
-                    <div className="bg-card border border-border rounded-lg shadow-xl max-w-md w-full p-6" onClick={e => e.stopPropagation()}>
-                        <div className="flex items-center gap-3 mb-3"><AlertCircle className="w-6 h-6 text-destructive shrink-0" /><h3 className="text-lg font-semibold text-destructive">{actionError.title}</h3></div>
-                        <p className="text-sm text-muted-foreground mb-4">{actionError.message}</p>
-                        {actionError.details && <pre className="text-xs text-muted-foreground bg-secondary p-2 rounded overflow-auto max-h-32 mb-4">{actionError.details}</pre>}
-                        <button onClick={() => setActionError(null)} className="w-full px-4 py-2 rounded-md text-sm font-medium bg-foreground text-background hover:bg-white/90 transition-colors">关闭</button>
+                <div className="fixed inset-0 z-[150] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-200" onClick={() => setActionError(null)}>
+                    <div className="bg-card border border-destructive/50 rounded-lg shadow-2xl max-w-lg w-full overflow-hidden" onClick={e => e.stopPropagation()}>
+                        <div className="bg-destructive/10 p-4 border-b border-destructive/20 flex items-center gap-3">
+                            <div className="p-2 bg-destructive/20 rounded-full">
+                                <AlertCircle className="text-destructive w-6 h-6" />
+                            </div>
+                            <div className="flex-1">
+                                <h3 className="text-lg font-semibold text-destructive">{actionError.title}</h3>
+                            </div>
+                            <button onClick={() => setActionError(null)} className="text-muted-foreground hover:text-foreground"><X size={20} /></button>
+                        </div>
+                        <div className="p-6 space-y-4">
+                            <p className="text-sm text-foreground font-medium whitespace-pre-line">{actionError.message}</p>
+
+                            {actionError.details && (
+                                <div className="bg-secondary/50 rounded-md p-3 border border-border">
+                                    <label className="text-[10px] text-muted-foreground uppercase tracking-wider font-bold block mb-1">Details / Configuration</label>
+                                    <pre className="text-xs font-mono text-muted-foreground whitespace-pre-wrap break-all overflow-auto max-h-40 select-all">
+                                        {actionError.details}
+                                    </pre>
+                                </div>
+                            )}
+
+                            {actionError.docLink && (
+                                <div className="mt-2">
+                                    <a
+                                        href={actionError.docLink}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="text-xs text-blue-500 hover:text-blue-400 hover:underline flex items-center gap-1"
+                                    >
+                                        <Link size={12} /> View Troubleshooting Documentation
+                                    </a>
+                                </div>
+                            )}
+                        </div>
+                        <div className="p-4 bg-secondary/30 border-t border-border flex justify-end">
+                            <button onClick={() => setActionError(null)} className="px-4 py-2 bg-foreground text-background rounded-md text-sm font-medium hover:opacity-90">
+                                Close
+                            </button>
+                        </div>
                     </div>
                 </div>
             )}
+
+            {/* Move Modal */}
+            {/* Move Modal */}
+            {moveModal.show && (
+                isMobile ? (
+                    <BottomSheet
+                        isOpen={moveModal.show}
+                        onClose={() => setMoveModal({ ...moveModal, show: false })}
+                        title="Move Items"
+                        height="auto"
+                    >
+                        <div className="space-y-6 pb-4">
+                            <div className="flex items-center gap-3">
+                                <div className="w-12 h-12 rounded-full bg-blue-500/10 flex items-center justify-center shrink-0">
+                                    <FolderInput className="text-blue-500 w-6 h-6" />
+                                </div>
+                                <div>
+                                    <p className="text-sm text-muted-foreground">Moving {selectedKeys.size} items</p>
+                                </div>
+                            </div>
+
+                            <div className="space-y-4">
+                                <div>
+                                    <label className="text-xs font-medium text-muted-foreground block mb-2">Destination Bucket</label>
+                                    <select
+                                        className="w-full bg-secondary border border-input rounded-xl px-4 py-3 text-sm outline-none appearance-none"
+                                        value={moveModal.targetBucket}
+                                        onChange={(e) => setMoveModal({ ...moveModal, targetBucket: e.target.value })}
+                                    >
+                                        {moveModal.bucketList.map(b => (
+                                            <option key={b.name} value={b.name}>{b.name}</option>
+                                        ))}
+                                    </select>
+                                </div>
+
+                                <div>
+                                    <label className="text-xs font-medium text-muted-foreground block mb-2">Destination Folder Path</label>
+                                    <div className="relative">
+                                        <input
+                                            type="text"
+                                            className="w-full bg-secondary border border-input rounded-xl pl-10 pr-4 py-3 text-sm outline-none focus:border-foreground font-mono"
+                                            placeholder="文件夹/子文件夹/"
+                                            value={moveModal.targetPrefix}
+                                            onChange={(e) => setMoveModal({ ...moveModal, targetPrefix: e.target.value })}
+                                        />
+                                        <Folder size={16} className="absolute left-3.5 top-3.5 text-muted-foreground" />
+                                    </div>
+                                    <p className="text-[10px] text-muted-foreground mt-1.5 ml-1">Leave empty to move to root. Use trailing slash for folders.</p>
+                                </div>
+                            </div>
+
+                            <div className="flex flex-col gap-3">
+                                <button onClick={handleMoveSelected} className="w-full bg-blue-600 text-white py-3.5 rounded-xl text-base font-medium hover:bg-blue-500 transition-colors shadow-sm active:scale-[0.98] transition-transform">移动项目</button>
+                                <button onClick={() => setMoveModal({ ...moveModal, show: false })} className="w-full bg-secondary text-foreground py-3.5 rounded-xl text-base font-medium hover:bg-secondary/80 transition-colors active:scale-[0.98] transition-transform">取消</button>
+                            </div>
+                        </div>
+                    </BottomSheet>
+                ) : (
+                    <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-200" onClick={() => setMoveModal({ ...moveModal, show: false })}>
+                        <div className="bg-card border border-border rounded-lg shadow-xl max-w-md w-full p-6" onClick={e => e.stopPropagation()}>
+                            <div className="flex items-center gap-3 mb-6">
+                                <div className="w-10 h-10 rounded-full bg-blue-500/10 flex items-center justify-center shrink-0">
+                                    <FolderInput className="text-blue-500 w-5 h-5" />
+                                </div>
+                                <div>
+                                    <h3 className="text-lg font-semibold">移动项目</h3>
+                                    <p className="text-xs text-muted-foreground">Moving {selectedKeys.size} items</p>
+                                </div>
+                            </div>
+
+                            <div className="space-y-4 mb-6">
+                                <div>
+                                    <label className="text-xs font-medium text-muted-foreground block mb-1.5">Destination Bucket</label>
+                                    <select
+                                        className="w-full bg-secondary border border-input rounded-md px-3 py-2 text-sm outline-none focus:border-foreground"
+                                        value={moveModal.targetBucket}
+                                        onChange={(e) => setMoveModal({ ...moveModal, targetBucket: e.target.value })}
+                                    >
+                                        {moveModal.bucketList.map(b => (
+                                            <option key={b.name} value={b.name}>{b.name}</option>
+                                        ))}
+                                    </select>
+                                </div>
+
+                                <div>
+                                    <label className="text-xs font-medium text-muted-foreground block mb-1.5">Destination Folder Path</label>
+                                    <div className="relative">
+                                        <input
+                                            type="text"
+                                            className="w-full bg-secondary border border-input rounded-md pl-8 pr-3 py-2 text-sm outline-none focus:border-foreground font-mono"
+                                            placeholder="文件夹/子文件夹/"
+                                            value={moveModal.targetPrefix}
+                                            onChange={(e) => setMoveModal({ ...moveModal, targetPrefix: e.target.value })}
+                                        />
+                                        <Folder size={14} className="absolute left-2.5 top-2.5 text-muted-foreground" />
+                                    </div>
+                                    <p className="text-[10px] text-muted-foreground mt-1">Leave empty to move to root. Use trailing slash for folders.</p>
+                                </div>
+                            </div>
+
+                            <div className="flex justify-end gap-3">
+                                <button onClick={() => setMoveModal({ ...moveModal, show: false })} className="px-4 py-2 rounded-md text-sm font-medium hover:bg-secondary transition-colors">取消</button>
+                                <button onClick={handleMoveSelected} className="px-4 py-2 rounded-md text-sm font-medium bg-blue-600 text-white hover:bg-blue-500 transition-colors shadow-sm">移动项目</button>
+                            </div>
+                        </div>
+                    </div>
+                )
+            )}
+
+            {/* Create File Modal */}
+            {createFileModal.show && (
+                <div className="fixed inset-0 z-[110] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-200" onClick={() => setCreateFileModal({ ...createFileModal, show: false })}>
+                    <div className="bg-card border border-border rounded-lg shadow-xl max-w-2xl w-full p-6 flex flex-col h-[600px] max-h-[90vh]" onClick={e => e.stopPropagation()}>
+                        <div className="flex justify-between items-center mb-4 shrink-0">
+                            <h3 className="text-lg font-semibold flex items-center gap-2"><FilePlus size={20} className="text-blue-500" /> Create New File</h3>
+                            <button onClick={() => setCreateFileModal({ ...createFileModal, show: false })}><X size={18} className="text-muted-foreground hover:text-foreground" /></button>
+                        </div>
+
+                        <div className="space-y-4 flex-1 flex flex-col min-h-0">
+                            <div>
+                                <label className="text-xs font-medium text-muted-foreground block mb-1.5">Filename</label>
+                                <input
+                                    type="text"
+                                    className="w-full bg-secondary border border-input rounded-md px-3 py-2 text-sm focus:border-foreground outline-none"
+                                    placeholder="example.txt, script.js, readme.md..."
+                                    value={createFileModal.filename}
+                                    onChange={(e) => setCreateFileModal({ ...createFileModal, filename: e.target.value })}
+                                    autoFocus
+                                />
+                            </div>
+                            <div className="flex-1 flex flex-col min-h-0">
+                                <label className="text-xs font-medium text-muted-foreground block mb-1.5">Content</label>
+                                <textarea
+                                    className="flex-1 w-full bg-background border border-input rounded-md p-4 text-sm font-mono text-foreground focus:border-foreground outline-none resize-none leading-relaxed"
+                                    placeholder="Type your content here..."
+                                    value={createFileModal.content}
+                                    onChange={(e) => setCreateFileModal({ ...createFileModal, content: e.target.value })}
+                                    spellCheck={false}
+                                />
+                            </div>
+                        </div>
+
+                        <div className="flex justify-end gap-3 mt-6 shrink-0">
+                            <button onClick={() => setCreateFileModal({ ...createFileModal, show: false })} className="px-4 py-2 rounded-md text-sm font-medium hover:bg-secondary transition-colors">取消</button>
+                            <button
+                                onClick={handleCreateFile}
+                                disabled={!createFileModal.filename.trim()}
+                                className="px-4 py-2 rounded-md text-sm font-medium bg-blue-600 text-white hover:bg-blue-500 transition-colors disabled:opacity-50"
+                            >
+                                Create File
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* Create Folder Modal */}
+            {createFolderModal.show && (
+                isMobile ? (
+                    <BottomSheet
+                        isOpen={createFolderModal.show}
+                        onClose={() => setCreateFolderModal({ show: false, folderName: '' })}
+                        title="新建文件夹"
+                        height="auto"
+                    >
+                        <div className="space-y-6 pb-4">
+                            <div>
+                                <label className="text-xs font-medium text-muted-foreground block mb-2">Folder Name</label>
+                                <input
+                                    type="text"
+                                    className="w-full bg-secondary border border-input rounded-lg px-4 py-3 text-base focus:border-foreground outline-none"
+                                    placeholder="my-folder"
+                                    value={createFolderModal.folderName}
+                                    onChange={(e) => setCreateFolderModal({ ...createFolderModal, folderName: e.target.value })}
+                                    autoFocus
+                                />
+                            </div>
+                            <div className="flex flex-col gap-3">
+                                <button
+                                    onClick={handleCreateFolder}
+                                    disabled={!createFolderModal.folderName.trim()}
+                                    className="w-full bg-blue-600 text-white py-3.5 rounded-xl text-base font-medium hover:bg-blue-500 transition-colors disabled:opacity-50 active:scale-[0.98]"
+                                >
+                                    Create Folder
+                                </button>
+                                <button
+                                    onClick={() => setCreateFolderModal({ show: false, folderName: '' })}
+                                    className="w-full bg-secondary text-foreground py-3.5 rounded-xl text-base font-medium hover:bg-secondary/80 active:scale-[0.98]"
+                                >
+                                    Cancel
+                                </button>
+                            </div>
+                        </div>
+                    </BottomSheet>
+                ) : (
+                    <div className="fixed inset-0 z-[110] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={() => setCreateFolderModal({ show: false, folderName: '' })}>
+                        <div className="bg-card border border-border rounded-lg shadow-xl max-w-md w-full p-6" onClick={e => e.stopPropagation()}>
+                            <div className="flex items-center gap-3 mb-4">
+                                <div className="w-10 h-10 rounded-full bg-blue-500/10 flex items-center justify-center">
+                                    <FolderPlus className="text-blue-500 w-5 h-5" />
+                                </div>
+                                <h3 className="text-lg font-semibold">新建文件夹</h3>
+                            </div>
+                            <div className="mb-6">
+                                <label className="text-xs font-medium text-muted-foreground block mb-2">Folder Name</label>
+                                <input
+                                    type="text"
+                                    className="w-full bg-secondary border border-input rounded-md px-3 py-2 text-sm focus:border-foreground outline-none"
+                                    placeholder="my-folder"
+                                    value={createFolderModal.folderName}
+                                    onChange={(e) => setCreateFolderModal({ ...createFolderModal, folderName: e.target.value })}
+                                    autoFocus
+                                />
+                            </div>
+                            <div className="flex justify-end gap-3">
+                                <button
+                                    onClick={() => setCreateFolderModal({ show: false, folderName: '' })}
+                                    className="px-4 py-2 rounded-md text-sm font-medium hover:bg-secondary transition-colors"
+                                >
+                                    Cancel
+                                </button>
+                                <button
+                                    onClick={handleCreateFolder}
+                                    disabled={!createFolderModal.folderName.trim()}
+                                    className="px-4 py-2 rounded-md text-sm font-medium bg-blue-600 text-white hover:bg-blue-500 transition-colors disabled:opacity-50"
+                                >
+                                    Create
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                )
+            )}
+
+            {/* Rename Modal */}
+            {renameModal.show && renameModal.file && (
+                isMobile ? (
+                    <BottomSheet
+                        isOpen={renameModal.show}
+                        onClose={() => setRenameModal({ show: false, file: null, newName: '' })}
+                        title={`Rename ${renameModal.file.isFolder ? 'Folder' : 'File'}`}
+                        height="auto"
+                    >
+                        <div className="space-y-6 pb-4">
+                            <div>
+                                <label className="text-xs font-medium text-muted-foreground block mb-2">New Name</label>
+                                <input
+                                    type="text"
+                                    className="w-full bg-secondary border border-input rounded-lg px-4 py-3 text-base focus:border-foreground outline-none font-mono"
+                                    placeholder={renameModal.file.name}
+                                    value={renameModal.newName}
+                                    onChange={(e) => setRenameModal({ ...renameModal, newName: e.target.value })}
+                                    autoFocus
+                                    onKeyDown={(e) => {
+                                        if (e.key === 'Enter' && renameModal.newName.trim()) handleRename();
+                                    }}
+                                />
+                            </div>
+                            <div className="flex flex-col gap-3">
+                                <button
+                                    onClick={handleRename}
+                                    disabled={!renameModal.newName.trim()}
+                                    className="w-full bg-blue-600 text-white py-3.5 rounded-xl text-base font-medium hover:bg-blue-500 transition-colors disabled:opacity-50 active:scale-[0.98]"
+                                >
+                                    Rename
+                                </button>
+                                <button
+                                    onClick={() => setRenameModal({ show: false, file: null, newName: '' })}
+                                    className="w-full bg-secondary text-foreground py-3.5 rounded-xl text-base font-medium hover:bg-secondary/80 active:scale-[0.98]"
+                                >
+                                    Cancel
+                                </button>
+                            </div>
+                        </div>
+                    </BottomSheet>
+                ) : (
+                    <div className="fixed inset-0 z-[110] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={() => setRenameModal({ show: false, file: null, newName: '' })}>
+                        <div className="bg-card border border-border rounded-lg shadow-xl max-w-md w-full p-6" onClick={e => e.stopPropagation()}>
+                            <div className="flex items-center gap-3 mb-4">
+                                <div className="w-10 h-10 rounded-full bg-blue-500/10 flex items-center justify-center">
+                                    <Edit2 className="text-blue-500 w-5 h-5" />
+                                </div>
+                                <h3 className="text-lg font-semibold">Rename {renameModal.file.isFolder ? 'Folder' : 'File'}</h3>
+                            </div>
+                            <div className="mb-6">
+                                <label className="text-xs font-medium text-muted-foreground block mb-2">New Name</label>
+                                <input
+                                    type="text"
+                                    className="w-full bg-secondary border border-input rounded-md px-3 py-2 text-sm focus:border-foreground outline-none font-mono"
+                                    placeholder={renameModal.file.name}
+                                    value={renameModal.newName}
+                                    onChange={(e) => setRenameModal({ ...renameModal, newName: e.target.value })}
+                                    autoFocus
+                                    onKeyDown={(e) => {
+                                        if (e.key === 'Enter' && renameModal.newName.trim()) handleRename();
+                                    }}
+                                />
+                            </div>
+                            <div className="flex justify-end gap-3">
+                                <button
+                                    onClick={() => setRenameModal({ show: false, file: null, newName: '' })}
+                                    className="px-4 py-2 rounded-md text-sm font-medium hover:bg-secondary transition-colors"
+                                >
+                                    Cancel
+                                </button>
+                                <button
+                                    onClick={handleRename}
+                                    disabled={!renameModal.newName.trim()}
+                                    className="px-4 py-2 rounded-md text-sm font-medium bg-blue-600 text-white hover:bg-blue-500 transition-colors disabled:opacity-50"
+                                >
+                                    Rename
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                )
+            )}
+
+            {/* Delete Confirmation Modal */}
+            {deleteConfirmation.show && (
+                isMobile ? (
+                    <BottomSheet
+                        isOpen={deleteConfirmation.show}
+                        onClose={() => setDeleteConfirmation({ show: false })}
+                        title={`Delete ${selectedKeys.size > 1 ? `${selectedKeys.size} Items` : 'Item'}`}
+                        height="auto"
+                    >
+                        <div className="space-y-6 pb-4">
+                            <div className="flex flex-col items-center justify-center py-4 text-destructive gap-2">
+                                <div className="w-16 h-16 rounded-full bg-destructive/10 flex items-center justify-center">
+                                    <AlertTriangle className="w-8 h-8" />
+                                </div>
+                            </div>
+                            <p className="text-center text-muted-foreground">
+                                Are you sure you want to delete the selected items? This action cannot be undone.
+                            </p>
+                            <div className="flex flex-col gap-3">
+                                <button onClick={handleBulkDelete} className="w-full bg-destructive text-destructive-foreground py-3.5 rounded-xl text-base font-medium hover:opacity-90 transition-opacity shadow-sm active:scale-[0.98] transition-transform">删除</button>
+                                <button onClick={() => setDeleteConfirmation({ show: false })} className="w-full bg-secondary text-foreground py-3.5 rounded-xl text-base font-medium hover:bg-secondary/80 transition-colors active:scale-[0.98] transition-transform">取消</button>
+                            </div>
+                        </div>
+                    </BottomSheet>
+                ) : (
+                    <div className="fixed inset-0 z-[110] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-200" onClick={() => setDeleteConfirmation({ show: false })}>
+                        <div className="bg-card border border-border rounded-lg shadow-xl max-w-md w-full p-6" onClick={e => e.stopPropagation()}>
+                            <div className="flex items-center gap-3 mb-4">
+                                <div className="w-10 h-10 rounded-full bg-destructive/10 flex items-center justify-center shrink-0">
+                                    <AlertTriangle className="text-destructive w-5 h-5" />
+                                </div>
+                                <h3 className="text-lg font-semibold">Delete {selectedKeys.size > 1 ? `${selectedKeys.size} Items` : 'Item'}</h3>
+                            </div>
+                            <p className="text-muted-foreground text-sm mb-6">
+                                Are you sure you want to delete the selected items? This action cannot be undone.
+                            </p>
+                            <div className="flex justify-end gap-3">
+                                <button onClick={() => setDeleteConfirmation({ show: false })} className="px-4 py-2 rounded-md text-sm font-medium hover:bg-secondary transition-colors">取消</button>
+                                <button onClick={handleBulkDelete} className="px-4 py-2 rounded-md text-sm font-medium bg-destructive text-destructive-foreground hover:opacity-90 transition-opacity shadow-sm">删除</button>
+                            </div>
+                        </div>
+                    </div>
+                )
+            )}
+
+            {/* Share Modal */}
+            {shareModal.show && shareModal.file && (
+                isMobile ? (
+                    <BottomSheet
+                        isOpen={shareModal.show}
+                        onClose={() => setShareModal({ show: false, file: null, url: null, duration: 3600 })}
+                        title="Share File"
+                        height="auto"
+                    >
+                        {!shareModal.url ? (
+                            <div className="space-y-6 pb-4">
+                                <p className="text-sm text-muted-foreground">Generate a temporary public link for <span className="font-medium text-foreground">{shareModal.file.name}</span>.</p>
+                                <div>
+                                    <label className="text-xs font-medium text-muted-foreground block mb-2">Expiration</label>
+                                    <select
+                                        className="w-full bg-secondary border border-border rounded-xl px-4 py-3 text-sm outline-none appearance-none"
+                                        value={shareModal.duration}
+                                        onChange={(e) => setShareModal(prev => ({ ...prev, duration: Number(e.target.value) }))}
+                                    >
+                                        <option value={3600}>1 Hour</option>
+                                        <option value={86400}>1 Day</option>
+                                        <option value={604800}>7 Days</option>
+                                    </select>
+                                </div>
+                                <button onClick={generateShareLink} className="w-full bg-primary text-primary-foreground py-3.5 rounded-xl text-base font-medium hover:opacity-90 transition-opacity shadow-sm active:scale-[0.98] transition-transform">Generate Link</button>
+                            </div>
+                        ) : (
+                            <div className="space-y-6 pb-4">
+                                <div className="flex flex-col items-center justify-center py-4 text-green-500 gap-2">
+                                    <div className="w-12 h-12 rounded-full bg-green-500/10 flex items-center justify-center">
+                                        <Check size={24} />
+                                    </div>
+                                    <p className="font-medium">Link Generated!</p>
+                                </div>
+                                <div className="bg-secondary p-4 rounded-xl break-all text-xs font-mono text-muted-foreground border border-border">
+                                    {shareModal.url}
+                                </div>
+                                <button
+                                    onClick={() => {
+                                        navigator.clipboard.writeText(shareModal.url!);
+                                        setNotification("Link copied to clipboard");
+                                    }}
+                                    className="w-full bg-foreground text-background py-3.5 rounded-xl text-base font-medium transition-colors flex items-center justify-center gap-2 shadow-sm active:scale-[0.98] transition-transform"
+                                >
+                                    <Copy size={18} /> Copy to Clipboard
+                                </button>
+                            </div>
+                        )}
+                    </BottomSheet>
+                ) : (
+                    <div className="fixed inset-0 z-[110] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-200" onClick={() => setShareModal({ show: false, file: null, url: null, duration: 3600 })}>
+                        <div className="bg-card border border-border rounded-lg shadow-xl max-w-md w-full p-6" onClick={e => e.stopPropagation()}>
+                            <div className="flex items-center justify-between mb-4">
+                                <h3 className="text-lg font-semibold">Share File</h3>
+                                <button onClick={() => setShareModal({ show: false, file: null, url: null, duration: 3600 })}><X size={18} className="text-muted-foreground hover:text-foreground" /></button>
+                            </div>
+
+                            {!shareModal.url ? (
+                                <div className="space-y-4">
+                                    <p className="text-sm text-muted-foreground">Generate a temporary public link for <span className="font-medium text-foreground">{shareModal.file.name}</span>.</p>
+                                    <div>
+                                        <label className="text-xs font-medium text-muted-foreground">Expiration</label>
+                                        <select
+                                            className="w-full mt-1 bg-secondary border border-border rounded-md px-3 py-2 text-sm outline-none"
+                                            value={shareModal.duration}
+                                            onChange={(e) => setShareModal(prev => ({ ...prev, duration: Number(e.target.value) }))}
+                                        >
+                                            <option value={3600}>1 Hour</option>
+                                            <option value={86400}>1 Day</option>
+                                            <option value={604800}>7 Days</option>
+                                        </select>
+                                    </div>
+                                    <button onClick={generateShareLink} className="w-full bg-primary text-primary-foreground py-2 rounded-md text-sm font-medium hover:opacity-90 transition-opacity">Generate Link</button>
+                                </div>
+                            ) : (
+                                <div className="space-y-4">
+                                    <p className="text-sm text-green-500 flex items-center gap-2"><Check size={14} /> Link Generated!</p>
+                                    <div className="bg-secondary p-3 rounded-md break-all text-xs font-mono text-muted-foreground border border-border">
+                                        {shareModal.url}
+                                    </div>
+                                    <button
+                                        onClick={() => {
+                                            navigator.clipboard.writeText(shareModal.url!);
+                                            setNotification("Link copied to clipboard");
+                                        }}
+                                        className="w-full bg-secondary hover:bg-secondary/80 text-foreground py-2 rounded-md text-sm font-medium transition-colors border border-border flex items-center justify-center gap-2"
+                                    >
+                                        <Copy size={14} /> Copy to Clipboard
+                                    </button>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                )
+            )}
+
+            {/* Preview Modal (Lightbox) */}
+            {previewFile && (
+                <div className="fixed inset-0 z-[100] flex items-center justify-center bg-background backdrop-blur-sm animate-in fade-in duration-200 transition-colors" onClick={closePreview}>
+                    {/* Navigation Controls */}
+                    <button onClick={(e) => { e.stopPropagation(); navigatePreview(-1) }} className="absolute left-4 top-1/2 -translate-y-1/2 p-3 rounded-full bg-secondary/50 hover:bg-secondary text-muted-foreground hover:text-foreground transition-all z-50 hover:scale-110 hidden md:block shadow-sm border border-border/50"><ChevronLeft size={32} /></button>
+                    <button onClick={(e) => { e.stopPropagation(); navigatePreview(1) }} className="absolute right-4 top-1/2 -translate-y-1/2 p-3 rounded-full bg-secondary/50 hover:bg-secondary text-muted-foreground hover:text-foreground transition-all z-50 hover:scale-110 hidden md:block shadow-sm border border-border/50"><ChevronRightIcon size={32} /></button>
+
+                    <div className="relative w-full h-full flex flex-col" onClick={e => e.stopPropagation()}>
+                        {/* Header */}
+                        <div className="h-16 flex items-center justify-between px-4 md:px-6 border-b border-border bg-background z-40">
+                            <div className="flex flex-col min-w-0 mr-4">
+                                <span className="font-medium text-foreground text-sm truncate">{previewFile.file.name}</span>
+                                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                                    <span>{formatBytes(previewFile.file.size)}</span>
+                                    {typeof previewFile.content === 'string' && (
+                                        <>
+                                            <span>•</span>
+                                            <span>{previewFile.content.split('\n').length.toLocaleString()} {previewFile.content.split('\n').length === 1 ? 'line' : 'lines'}</span>
+                                        </>
+                                    )}
+                                </div>
+                            </div>
+
+                            {/* Markdown Tabs */}
+                            {isEditing && previewFile.file.name.endsWith('.md') && (
+                                <div className="absolute left-1/2 top-16 md:top-1/2 -translate-x-1/2 md:-translate-y-1/2 flex bg-secondary rounded-lg p-0.5 mt-2 md:mt-0 z-50 border border-border">
+                                    <button
+                                        onClick={() => setMdTab('write')}
+                                        className={`px-3 py-1 rounded-md text-xs font-medium transition-all flex items-center gap-2 ${mdTab === 'write' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
+                                    >
+                                        <PenTool size={12} /> Write
+                                    </button>
+                                    <button
+                                        onClick={() => setMdTab('preview')}
+                                        className={`px-3 py-1 rounded-md text-xs font-medium transition-all flex items-center gap-2 ${mdTab === 'preview' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
+                                    >
+                                        <BookOpen size={12} /> Preview
+                                    </button>
+                                </div>
+                            )}
+
+                            <div className="flex items-center gap-2">
+                                {previewFile.content !== undefined && !readOnly && !['csv', 'binary', 'docx', 'xlsx', 'unsupported-legacy'].includes(previewFile.content as string) && (
+                                    isEditing ? (
+                                        <button onClick={saveEditedContent} className="px-3 py-1.5 bg-green-600 text-white rounded text-xs font-medium flex items-center gap-2 hover:bg-green-500 shadow-sm"><Save size={14} /> Save</button>
+                                    ) : (
+                                        <button onClick={() => setIsEditing(true)} className="px-3 py-1.5 bg-secondary text-foreground rounded text-xs font-medium flex items-center gap-2 hover:bg-secondary/80 border border-border"><Edit2 size={14} /> Edit</button>
+                                    )
+                                )}
+                                <button onClick={() => setShowMetadata(!showMetadata)} className={`p-2 rounded transition-colors ${showMetadata ? 'bg-secondary text-foreground' : 'hover:bg-secondary text-muted-foreground hover:text-foreground'}`} title="Info"><Info size={18} /></button>
+                                <button onClick={() => openShareModal(previewFile.file)} className="p-2 rounded hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors" title="Share"><Share2 size={18} /></button>
+                                <button onClick={() => handleDownload(previewFile.file)} className="p-2 rounded hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors" title="Download"><Download size={18} /></button>
+                                <button onClick={closePreview} className="p-2 rounded hover:bg-destructive/10 text-muted-foreground hover:text-destructive transition-colors" title="Close"><X size={18} /></button>
+                            </div>
+                        </div>
+
+                        {/* Content Area */}
+                        <div className="flex-1 overflow-hidden flex items-center justify-center relative bg-background transition-colors">
+                            {renderContent()}
+                        </div>
+
+                        {/* Metadata Panel */}
+                        {showMetadata && (
+                            isMobile ? (
+                                <BottomSheet onClose={() => setShowMetadata(false)}>
+                                    <div className="p-4">
+                                        <div className="flex items-center justify-between mb-4">
+                                            <h3 className="text-lg font-semibold text-foreground">File Information</h3>
+                                            <button onClick={() => setShowMetadata(false)} className="p-2 rounded-lg hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors">
+                                                <X size={20} />
+                                            </button>
+                                        </div>
+                                        
+                                        <div className="space-y-4">
+                                            {/* Basic File Info */}
+                                            <div className="space-y-2">
+                                                <h4 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">Properties</h4>
+                                                <div className="space-y-2 text-sm">
+                                                    <div className="flex justify-between py-1">
+                                                        <span className="text-muted-foreground">Size:</span>
+                                                        <span className="font-medium text-foreground">{formatBytes(previewFile.file.size)}</span>
+                                                    </div>
+                                                    {previewFile.file.lastModified && (
+                                                        <div className="flex justify-between py-1">
+                                                            <span className="text-muted-foreground">Modified:</span>
+                                                            <span className="font-medium text-foreground">{new Date(previewFile.file.lastModified).toLocaleString()}</span>
+                                                        </div>
+                                                    )}
+                                                    {previewFile.file.mimeType && (
+                                                        <div className="flex justify-between py-1">
+                                                            <span className="text-muted-foreground">Type:</span>
+                                                            <span className="font-medium text-foreground">{previewFile.file.mimeType}</span>
+                                                        </div>
+                                                    )}
+                                                    {previewFile.file.eTag && (
+                                                        <div className="flex justify-between py-1">
+                                                            <span className="text-muted-foreground">ETag:</span>
+                                                            <span className="font-mono text-xs text-foreground truncate max-w-[200px]">{previewFile.file.eTag}</span>
+                                                        </div>
+                                                    )}
+                                                    {previewFile.file.storageClass && (
+                                                        <div className="flex justify-between py-1">
+                                                            <span className="text-muted-foreground">Storage:</span>
+                                                            <span className="font-medium text-foreground">{previewFile.file.storageClass}</span>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            </div>
+
+                                            {/* EXIF Data */}
+                                            {exifData && (
+                                                <div className="space-y-2 pt-4 border-t border-border">
+                                                    <h4 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">EXIF Data</h4>
+                                                    <div className="space-y-2 text-sm">
+                                                        {exifData.Make && exifData.Model && (
+                                                            <div className="flex justify-between py-1">
+                                                                <span className="text-muted-foreground">Camera:</span>
+                                                                <span className="font-medium text-foreground">{exifData.Make} {exifData.Model}</span>
+                                                            </div>
+                                                        )}
+                                                        {exifData.DateTimeOriginal && (
+                                                            <div className="flex justify-between py-1">
+                                                                <span className="text-muted-foreground">Taken:</span>
+                                                                <span className="font-medium text-foreground">{new Date(exifData.DateTimeOriginal).toLocaleString()}</span>
+                                                            </div>
+                                                        )}
+                                                        {(exifData.ImageWidth || exifData.ExifImageWidth) && (exifData.ImageHeight || exifData.ExifImageHeight) && (
+                                                            <div className="flex justify-between py-1">
+                                                                <span className="text-muted-foreground">Dimensions:</span>
+                                                                <span className="font-medium text-foreground">{exifData.ImageWidth || exifData.ExifImageWidth} × {exifData.ImageHeight || exifData.ExifImageHeight}</span>
+                                                            </div>
+                                                        )}
+                                                        {exifData.ISO && (
+                                                            <div className="flex justify-between py-1">
+                                                                <span className="text-muted-foreground">ISO:</span>
+                                                                <span className="font-medium text-foreground">{exifData.ISO}</span>
+                                                            </div>
+                                                        )}
+                                                        {exifData.FNumber && (
+                                                            <div className="flex justify-between py-1">
+                                                                <span className="text-muted-foreground">Aperture:</span>
+                                                                <span className="font-medium text-foreground">f/{exifData.FNumber}</span>
+                                                            </div>
+                                                        )}
+                                                        {exifData.ExposureTime && (
+                                                            <div className="flex justify-between py-1">
+                                                                <span className="text-muted-foreground">Shutter:</span>
+                                                                <span className="font-medium text-foreground">{exifData.ExposureTime < 1 ? `1/${Math.round(1 / exifData.ExposureTime)}s` : `${exifData.ExposureTime}s`}</span>
+                                                            </div>
+                                                        )}
+                                                        {exifData.FocalLength && (
+                                                            <div className="flex justify-between py-1">
+                                                                <span className="text-muted-foreground">Focal Length:</span>
+                                                                <span className="font-medium text-foreground">{exifData.FocalLength}mm</span>
+                                                            </div>
+                                                        )}
+                                                        {(exifData.latitude || exifData.GPSLatitude) && (exifData.longitude || exifData.GPSLongitude) && (
+                                                            <div className="flex justify-between py-1">
+                                                                <span className="text-muted-foreground">GPS:</span>
+                                                                <span className="font-mono text-xs text-foreground">
+                                                                    {(exifData.latitude || exifData.GPSLatitude).toFixed(6)}, {(exifData.longitude || exifData.GPSLongitude).toFixed(6)}
+                                                                </span>
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                            )}
+                                        </div>
+                                    </div>
+                                </BottomSheet>
+                            ) : (
+                                <div className="absolute top-16 right-0 w-80 h-[calc(100%-4rem)] bg-background border-l border-border overflow-y-auto shadow-xl animate-in slide-in-from-right duration-200">
+                                    <div className="p-6">
+                                        <div className="flex items-center justify-between mb-6">
+                                            <h3 className="text-lg font-semibold text-foreground">File Information</h3>
+                                            <button onClick={() => setShowMetadata(false)} className="p-2 rounded-lg hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors">
+                                                <X size={20} />
+                                            </button>
+                                        </div>
+                                        
+                                        <div className="space-y-6">
+                                            {/* Basic File Info */}
+                                            <div className="space-y-3">
+                                                <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Properties</h4>
+                                                <div className="space-y-3 text-sm">
+                                                    <div className="flex flex-col gap-1">
+                                                        <span className="text-muted-foreground text-xs">大小</span>
+                                                        <span className="font-medium text-foreground">{formatBytes(previewFile.file.size)}</span>
+                                                    </div>
+                                                    {previewFile.file.lastModified && (
+                                                        <div className="flex flex-col gap-1">
+                                                            <span className="text-muted-foreground text-xs">修改时间</span>
+                                                            <span className="font-medium text-foreground">{new Date(previewFile.file.lastModified).toLocaleString()}</span>
+                                                        </div>
+                                                    )}
+                                                    {previewFile.file.mimeType && (
+                                                        <div className="flex flex-col gap-1">
+                                                            <span className="text-muted-foreground text-xs">Type</span>
+                                                            <span className="font-medium text-foreground break-all">{previewFile.file.mimeType}</span>
+                                                        </div>
+                                                    )}
+                                                    {previewFile.file.eTag && (
+                                                        <div className="flex flex-col gap-1">
+                                                            <span className="text-muted-foreground text-xs">ETag</span>
+                                                            <span className="font-mono text-xs text-foreground break-all">{previewFile.file.eTag}</span>
+                                                        </div>
+                                                    )}
+                                                    {previewFile.file.storageClass && (
+                                                        <div className="flex flex-col gap-1">
+                                                            <span className="text-muted-foreground text-xs">Storage Class</span>
+                                                            <span className="font-medium text-foreground">{previewFile.file.storageClass}</span>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            </div>
+
+                                            {/* EXIF Data */}
+                                            {exifData && (
+                                                <div className="space-y-3 pt-6 border-t border-border">
+                                                    <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">EXIF Data</h4>
+                                                    <div className="space-y-3 text-sm">
+                                                        {exifData.Make && exifData.Model && (
+                                                            <div className="flex flex-col gap-1">
+                                                                <span className="text-muted-foreground text-xs">Camera</span>
+                                                                <span className="font-medium text-foreground">{exifData.Make} {exifData.Model}</span>
+                                                            </div>
+                                                        )}
+                                                        {exifData.DateTimeOriginal && (
+                                                            <div className="flex flex-col gap-1">
+                                                                <span className="text-muted-foreground text-xs">Date Taken</span>
+                                                                <span className="font-medium text-foreground">{new Date(exifData.DateTimeOriginal).toLocaleString()}</span>
+                                                            </div>
+                                                        )}
+                                                        {(exifData.ImageWidth || exifData.ExifImageWidth) && (exifData.ImageHeight || exifData.ExifImageHeight) && (
+                                                            <div className="flex flex-col gap-1">
+                                                                <span className="text-muted-foreground text-xs">Dimensions</span>
+                                                                <span className="font-medium text-foreground">{exifData.ImageWidth || exifData.ExifImageWidth} × {exifData.ImageHeight || exifData.ExifImageHeight}</span>
+                                                            </div>
+                                                        )}
+                                                        {exifData.ISO && (
+                                                            <div className="flex flex-col gap-1">
+                                                                <span className="text-muted-foreground text-xs">ISO</span>
+                                                                <span className="font-medium text-foreground">{exifData.ISO}</span>
+                                                            </div>
+                                                        )}
+                                                        {exifData.FNumber && (
+                                                            <div className="flex flex-col gap-1">
+                                                                <span className="text-muted-foreground text-xs">Aperture</span>
+                                                                <span className="font-medium text-foreground">f/{exifData.FNumber}</span>
+                                                            </div>
+                                                        )}
+                                                        {exifData.ExposureTime && (
+                                                            <div className="flex flex-col gap-1">
+                                                                <span className="text-muted-foreground text-xs">Shutter Speed</span>
+                                                                <span className="font-medium text-foreground">{exifData.ExposureTime < 1 ? `1/${Math.round(1 / exifData.ExposureTime)}s` : `${exifData.ExposureTime}s`}</span>
+                                                            </div>
+                                                        )}
+                                                        {exifData.FocalLength && (
+                                                            <div className="flex flex-col gap-1">
+                                                                <span className="text-muted-foreground text-xs">Focal Length</span>
+                                                                <span className="font-medium text-foreground">{exifData.FocalLength}mm</span>
+                                                            </div>
+                                                        )}
+                                                        {(exifData.latitude || exifData.GPSLatitude) && (exifData.longitude || exifData.GPSLongitude) && (
+                                                            <div className="flex flex-col gap-1">
+                                                                <span className="text-muted-foreground text-xs">GPS Coordinates</span>
+                                                                <span className="font-mono text-xs text-foreground break-all">
+                                                                    {(exifData.latitude || exifData.GPSLatitude).toFixed(6)}, {(exifData.longitude || exifData.GPSLongitude).toFixed(6)}
+                                                                </span>
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                            )}
+                                        </div>
+                                    </div>
+                                </div>
+                            )
+                        )}
+                    </div>
+                </div>
+            )}
+
+            {/* Toolbar */}
+            <div
+                className="h-14 md:h-16 border-b border-border flex items-center justify-between px-4 md:px-6 shrink-0 gap-2 bg-background/80 backdrop-blur sticky top-0 z-10"
+                style={{ paddingTop: `${safeArea.top}px`, paddingLeft: `${Math.max(16, safeArea.left)}px`, paddingRight: `${Math.max(16, safeArea.right)}px` }}
+                onClick={e => e.stopPropagation()}
+            >
+                <div className="flex items-center gap-2 md:gap-4 flex-1 min-w-0">
+                    <button
+                        onClick={handleUp}
+                        disabled={!currentPrefix && !onBackToBuckets}
+                        className="p-2 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors disabled:opacity-30"
+                    >
+                        <ArrowLeft size={18} />
+                    </button>
+
+                    {/* Breadcrumbs */}
+                    <div className="flex items-center text-sm overflow-x-auto whitespace-nowrap mask-linear-fade no-scrollbar">
+                        <span
+                            className={`cursor-pointer transition-colors font-mono flex items-center gap-2 ${!currentPrefix ? 'text-foreground font-semibold' : 'text-muted-foreground hover:text-foreground'}`}
+                            onClick={() => setCurrentPrefix('')}
+                        >
+                            <Database size={14} className="opacity-50 shrink-0" />
+                            <span className="leading-none">{bucketName}</span>
+                        </span>
+                        <span className="mx-1.5 text-muted-foreground/50"><ChevronRight size={14} /></span>
+                        {currentPrefix.split('/').filter(Boolean).map((part, idx, arr) => (
+                            <React.Fragment key={idx}>
+                                <span
+                                    className={`cursor-pointer transition-colors font-mono ${idx === arr.length - 1 ? 'text-foreground font-semibold' : 'text-muted-foreground hover:text-foreground'}`}
+                                    onClick={() => {
+                                        const newPath = arr.slice(0, idx + 1).join('/') + '/';
+                                        setCurrentPrefix(newPath);
+                                    }}
+                                >
+                                    {part}
+                                </span>
+                                {idx < arr.length - 1 && <span className="mx-1.5 text-muted-foreground/50"><ChevronRight size={14} /></span>}
+                            </React.Fragment>
+                        ))}
+                    </div>
+                </div>
+
+                <div className="flex items-center gap-2 md:gap-3 ml-auto">
+                    <div className="relative hidden md:block">
+                        <Search className="absolute left-2.5 top-2.5 text-muted-foreground w-4 h-4" />
+                        <input
+                            type="text"
+                            placeholder="Filter..."
+                            className="bg-secondary border border-transparent hover:border-border focus:border-foreground rounded-md pl-9 pr-8 py-1.5 text-sm outline-none w-40 lg:w-56 transition-all"
+                            value={searchInput}
+                            onChange={(e) => setSearchInput(e.target.value)}
+                        />
+                        {searchInput && (
+                            <button
+                                onClick={() => setSearchInput('')}
+                                className="absolute right-2 top-2 p-0.5 hover:bg-secondary-foreground/10 rounded-full text-muted-foreground"
+                                title="Clear search"
+                            >
+                                <X size={14} />
+                            </button>
+                        )}
+                    </div>
+
+                    {/* Sort Controls */}
+                    <div className="hidden md:flex items-center gap-1 bg-secondary rounded-md p-0.5 border border-border">
+                        <button
+                            onClick={() => setSortBy('name')}
+                            className={`px-2 py-1.5 rounded-sm text-xs font-medium transition-all flex items-center gap-1 ${sortBy === 'name' ? 'bg-background shadow-sm text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+                            title="Sort by name"
+                        >
+                            <Type size={14} /> Name
+                        </button>
+                        <button
+                            onClick={() => setSortBy('size')}
+                            className={`px-2 py-1.5 rounded-sm text-xs font-medium transition-all flex items-center gap-1 ${sortBy === 'size' ? 'bg-background shadow-sm text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+                            title="Sort by size"
+                        >
+                            <HardDriveDownload size={14} /> Size
+                        </button>
+                        <button
+                            onClick={() => setSortBy('date')}
+                            className={`px-2 py-1.5 rounded-sm text-xs font-medium transition-all flex items-center gap-1 ${sortBy === 'date' ? 'bg-background shadow-sm text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+                            title="Sort by date"
+                        >
+                            <Calendar size={14} /> Date
+                        </button>
+                        <button
+                            onClick={() => setSortDirection(d => d === 'asc' ? 'desc' : 'asc')}
+                            className="px-1.5 py-1.5 rounded-sm hover:bg-background text-muted-foreground hover:text-foreground transition-all"
+                            title={`Sort ${sortDirection === 'asc' ? 'descending' : 'ascending'}`}
+                        >
+                            {sortDirection === 'asc' ? <ArrowUp size={14} /> : <ArrowDown size={14} />}
+                        </button>
+                    </div>
+
+                    <button
+                        onClick={toggleSelectionMode}
+                        className={`p-2 rounded-md transition-all flex items-center gap-2 ${selectionMode ? 'bg-blue-600 text-white hover:bg-blue-500 shadow-md' : 'text-muted-foreground hover:text-foreground hover:bg-secondary'}`}
+                        title={selectionMode ? "Exit Selection Mode" : "Enter Selection Mode"}
+                    >
+                        {selectionMode ? <CheckCircle2 size={18} /> : <CheckSquare size={18} />}
+                        <span className="text-xs font-medium hidden sm:inline">{selectionMode ? 'Done' : 'Select'}</span>
+                    </button>
+
+                    <button onClick={() => setRefreshTrigger(p => p + 1)} className="p-2 text-muted-foreground hover:text-foreground hover:bg-secondary rounded-md transition-colors">
+                        <RefreshCw size={18} className={loading ? "animate-spin" : ""} />
+                    </button>
+
+                    <div className="hidden sm:flex bg-secondary rounded-md p-0.5 border border-border">
+                        <button onClick={() => setViewMode(ViewMode.LIST)} className={`p-1.5 rounded-sm transition-all ${viewMode === ViewMode.LIST ? 'bg-background shadow-sm text-foreground' : 'text-muted-foreground hover:text-foreground'}`}>
+                            <List size={16} />
+                        </button>
+                        <button onClick={() => setViewMode(ViewMode.GRID)} className={`p-1.5 rounded-sm transition-all ${viewMode === ViewMode.GRID ? 'bg-background shadow-sm text-foreground' : 'text-muted-foreground hover:text-foreground'}`}>
+                            <Grid size={16} />
+                        </button>
+                    </div>
+
+                    {!readOnly && (
+                        <>
+                            <button
+                                onClick={() => setCreateFolderModal({ show: true, folderName: '' })}
+                                className="p-2 text-muted-foreground hover:text-foreground hover:bg-secondary rounded-md transition-colors"
+                                title="New Folder"
+                            >
+                                <FolderPlus size={18} />
+                            </button>
+                            <button
+                                onClick={() => setCreateFileModal({ show: true, filename: '', content: '' })}
+                                className="p-2 text-muted-foreground hover:text-foreground hover:bg-secondary rounded-md transition-colors"
+                                title="New File"
+                            >
+                                <FilePlus size={18} />
+                            </button>
+
+                            <label className="cursor-pointer bg-foreground hover:opacity-90 text-background px-3 py-1.5 rounded-md text-sm font-medium flex items-center gap-2 transition-all shadow-sm active:scale-95">
+                                <Upload size={14} />
+                                <span className="hidden sm:inline">上传</span>
+                                <input
+                                    ref={fileInputRef}
+                                    type="file"
+                                    multiple
+                                    className="hidden"
+                                    onChange={(e) => {
+                                        if (e.target.files) Array.from(e.target.files).forEach(f => onUpload(f, currentPrefix, () => setRefreshTrigger(p => p + 1)));
+                                        // Reset input so same file can be selected again if needed
+                                        if (e.target) e.target.value = '';
+                                    }}
+                                />
+                            </label>
+                        </>
+                    )}
+                </div>
+            </div>
+
+            {/* Pull Refresh Spinner */}
+            <div className="absolute top-14 md:top-16 left-0 right-0 flex justify-center z-0 pointer-events-none">
+                <Loader2 className={`w-6 h-6 text-blue-500 transition-all duration-200 ${isPulling ? 'opacity-100' : 'opacity-0'} ${pullDistance > 50 ? 'animate-spin' : ''}`} style={{ transform: `rotate(${pullDistance * 3}deg)` }} />
+            </div>
+
+            {/* File Area */}
+            <div
+                ref={listRef}
+                className="flex-1 overflow-y-auto bg-background overscroll-none pb-4 md:pb-20 relative z-10 transition-all duration-200 ease-out"
+                onTouchStart={handleTouchStart}
+                onTouchMove={handleTouchMove}
+                onTouchEnd={handleTouchEnd}
+                style={{ transform: isPulling ? `translateY(${pullDistance}px)` : 'none' }}
+            >
+
+
+                {/* Permission Denied / Error View */}
+                {viewError ? (
+                    <div className="flex flex-col items-center justify-center h-[60vh] p-8 text-center animate-in fade-in duration-500 select-text">
+                        <div className="w-20 h-20 bg-destructive/10 rounded-3xl flex items-center justify-center mb-6 ring-4 ring-destructive/5">
+                            <Lock size={40} className="text-destructive opacity-80" />
+                        </div>
+                        <h2 className="text-2xl font-bold text-foreground mb-2">{viewError.title}</h2>
+                        <p className="text-muted-foreground max-w-md mb-6 leading-relaxed whitespace-pre-line">
+                            {viewError.message}
+                        </p>
+
+                        {viewError.details && (
+                            <div className="bg-secondary/50 p-4 rounded-md border border-border text-left max-w-lg w-full mb-6">
+                                <div className="flex items-center justify-between mb-2">
+                                    <div className="flex items-center gap-2 text-xs font-bold text-muted-foreground uppercase tracking-wider">
+                                        <ShieldAlert size={14} />
+                                        <span>Configuration / Details</span>
+                                    </div>
+                                    <button onClick={() => navigator.clipboard.writeText(viewError.details!)} className="text-[10px] text-blue-500 hover:underline">复制</button>
+                                </div>
+                                <pre className="block text-xs font-mono text-muted-foreground/80 break-all whitespace-pre-wrap overflow-auto max-h-48 p-1">
+                                    {viewError.details}
+                                </pre>
+                            </div>
+                        )}
+
+                        <div className="flex gap-4">
+                            {viewError.docLink && (
+                                <a
+                                    href={viewError.docLink}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="px-4 py-2 border border-border rounded-full text-sm font-medium hover:bg-secondary transition-colors flex items-center gap-2"
+                                >
+                                    <Link size={14} /> Troubleshooting Guide
+                                </a>
+                            )}
+
+                            <button
+                                onClick={() => setRefreshTrigger(p => p + 1)}
+                                className="px-6 py-2 bg-foreground text-background rounded-full text-sm font-medium hover:opacity-90 transition-opacity shadow-lg"
+                            >
+                                Try Again
+                            </button>
+                        </div>
+                    </div>
+                ) : (
+                    !loading && (
+                        <div className="p-2 md:p-6 min-h-full">
+                            {filteredFiles.length === 0 && search && (
+                                <div className="text-center text-muted-foreground py-12">
+                                    <Search size={48} className="mx-auto mb-4 opacity-30" />
+                                    <p className="text-lg font-medium">No results found for "{search}"</p>
+                                    <p className="text-sm">Try adjusting your search or clearing the filter.</p>
+                                </div>
+                            )}
+                            {filteredFiles.length === 0 && !search && (
+                                <div className="text-center text-muted-foreground py-12">
+                                    <FileIcon size={48} className="mx-auto mb-4 opacity-30" />
+                                    <p className="text-lg font-medium">This folder is empty.</p>
+                                    {!readOnly && <p className="text-sm">Upload files or create a new one to get started.</p>}
+                                </div>
+                            )}
+
+                            {viewMode === ViewMode.LIST ? (
+                                isMobile ? (
+                                    <div className="flex flex-col divide-y divide-border pb-20">
+                                        {filteredFiles.map((file) => {
+                                            const isSelected = selectedKeys.has(file.key);
+                                            return (
+                                                <SwipeableListItem
+                                                    key={file.key}
+                                                    actions={readOnly ? [
+                                                        { id: 'share', icon: Share2, label: 'Share', color: 'blue' }
+                                                    ] : [
+                                                        { id: 'share', icon: Share2, label: 'Share', color: 'blue' },
+                                                        { id: 'rename', icon: Edit2, label: 'Rename', color: 'green' },
+                                                        { id: 'move', icon: FolderInput, label: 'Move', color: 'yellow' },
+                                                        { id: 'delete', icon: Trash2, label: 'Delete', color: 'red' }
+                                                    ]}
+                                                    onSwipeLeft={(actionId) => {
+                                                        if (actionId === 'share') openShareModal(file);
+                                                        if (actionId === 'rename') openRenameModal(file);
+                                                        if (actionId === 'move') {
+                                                            setSelectedKeys(new Set([file.key]));
+                                                            openMoveModal();
+                                                        }
+                                                        if (actionId === 'delete') {
+                                                            setSelectedKeys(new Set([file.key]));
+                                                            setDeleteConfirmation({ show: true });
+                                                        }
+                                                    }}
+                                                    onSwipeRight={() => {
+                                                        const newSelected = new Set(selectedKeys);
+                                                        if (newSelected.has(file.key)) {
+                                                            newSelected.delete(file.key);
+                                                        } else {
+                                                            newSelected.add(file.key);
+                                                        }
+                                                        setSelectedKeys(newSelected);
+                                                    }}
+                                                >
+                                                    <div
+                                                        className={`p-4 flex items-center gap-4 bg-background active:bg-secondary/50 transition-colors ${isSelected ? 'bg-blue-500/10' : ''}`}
+                                                        onClick={(e) => handleItemClick(file, e)}
+                                                        {...(isMobile ? {
+                                                            onTouchStart: (e) => dragHandlers.onTouchStart(e, file),
+                                                            onTouchMove: dragHandlers.onTouchMove,
+                                                            onTouchEnd: dragHandlers.onTouchEnd,
+                                                            onMouseEnter: file.isFolder ? () => setDropTarget(file) : undefined,
+                                                            onMouseLeave: () => setDropTarget(null)
+                                                        } : {})}
+                                                    >
+                                                        <div className="shrink-0 text-muted-foreground">
+                                                            {getIcon(file, 24)}
+                                                        </div>
+                                                        <div className="flex-1 min-w-0">
+                                                            <p className={`font-medium truncate text-sm ${isSelected ? 'text-blue-500' : 'text-foreground'}`}>{file.name}</p>
+                                                            <div className="flex items-center gap-2 text-xs text-muted-foreground mt-0.5">
+                                                                <span>{file.lastModified.toLocaleDateString()}</span>
+                                                                {!file.isFolder && (
+                                                                    <>
+                                                                        <span>•</span>
+                                                                        <span>{formatBytes(file.size)}</span>
+                                                                    </>
+                                                                )}
+                                                            </div>
+                                                        </div>
+                                                        {isSelected && <CheckCircle2 size={20} className="text-blue-500 shrink-0" />}
+                                                    </div>
+                                                </SwipeableListItem>
+                                            );
+                                        })}
+                                    </div>
+                                ) : (
+                                    <div className="rounded-lg border border-border overflow-hidden bg-card/50">
+                                        {filteredFiles.length > 0 && (
+                                            <table className="w-full text-left text-sm">
+                                                <thead className="bg-secondary border-b border-border text-muted-foreground font-medium">
+                                                    <tr>
+                                                        {selectionMode && (
+                                                            <th className="px-4 py-3 font-medium w-12">
+                                                                <div className="w-4 h-4 rounded border border-muted-foreground/50 flex items-center justify-center"><div className="w-2 h-2 bg-transparent"></div></div>
+                                                            </th>
+                                                        )}
+                                                        <th className="px-4 py-3 font-medium">名称</th>
+                                                        <th className="px-4 py-3 font-medium hidden sm:table-cell">大小</th>
+                                                        <th className="px-4 py-3 font-medium hidden md:table-cell">修改时间</th>
+                                                        <th className="px-4 py-3 w-[120px]"></th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody className="divide-y divide-border">
+                                                    {filteredFiles.map((file, index) => {
+                                                        const isSelected = selectedKeys.has(file.key);
+                                                        return (
+                                                            <tr
+                                                                key={file.key}
+                                                                className={`
+                                                  group transition-colors cursor-pointer select-none
+                                                  ${isSelected ? 'bg-blue-500/10 border-blue-500/20' : 'hover:bg-secondary/50'}
+                                              `}
+                                                                onClick={(e) => handleItemClick(file, e)}
+                                                                onTouchStart={(e) => handleLongPressStart(file, e)}
+                                                                onTouchEnd={(e) => {
+                                                                    handleLongPressEnd();
+                                                                    e.preventDefault();
+                                                                    handleItemClick(file, e as any);
+                                                                }}
+                                                                onTouchMove={handleLongPressEnd}
+                                                                onMouseDown={(e) => handleLongPressStart(file, e)}
+                                                                onMouseUp={handleLongPressEnd}
+                                                                onMouseLeave={handleLongPressEnd}
+                                                                draggable={!isMobile}
+                                                                onDragStart={(e) => handleDragStart(e, file)}
+                                                                onDragOver={(e) => handleDragOver(e, file)}
+                                                                onDragLeave={handleDragLeave}
+                                                                onDrop={(e) => handleDrop(e, file)}
+                                                            >
+                                                                {selectionMode && (
+                                                                    <td className="px-2 sm:px-4 py-3">
+                                                                        <div className={`w-4 h-4 rounded border flex items-center justify-center transition-colors ${isSelected ? 'bg-blue-500 border-blue-500' : 'border-muted-foreground/30 bg-background'}`}>
+                                                                            {isSelected && <Check size={10} className="text-white" />}
+                                                                        </div>
+                                                                    </td>
+                                                                )}
+                                                                <td className="px-2 sm:px-4 py-3">
+                                                                    <div className="flex items-center gap-2 sm:gap-3 min-w-0">
+                                                                        <div className="shrink-0">{getIcon(file, 18)}</div>
+                                                                        <span className={`font-medium truncate min-w-0 flex-1 block text-sm ${isSelected ? 'text-blue-500 dark:text-blue-400' : 'text-foreground'}`}>{file.name}</span>
+                                                                    </div>
+                                                                </td>
+                                                                <td className="px-2 sm:px-4 py-3 text-muted-foreground font-mono text-xs hidden sm:table-cell whitespace-nowrap">{!file.isFolder && formatBytes(file.size)}</td>
+                                                                <td className="px-2 sm:px-4 py-3 text-muted-foreground text-xs hidden md:table-cell whitespace-nowrap">{file.lastModified.toLocaleDateString()}</td>
+                                                                <td className="px-2 sm:px-4 py-3">
+                                                                    {!selectionMode && (
+                                                                        <div className="flex items-center justify-end gap-0.5 sm:gap-1 md:opacity-0 md:group-hover:opacity-100 transition-opacity">
+                                                                            <button onClick={(e) => { e.stopPropagation(); handleDownload(file) }} className="p-1 sm:p-1.5 hover:bg-secondary rounded text-muted-foreground hover:text-foreground" title="Download"><Download size={14} className="sm:w-4 sm:h-4" /></button>
+                                                                            <button onClick={(e) => { e.stopPropagation(); openShareModal(file) }} className="p-1 sm:p-1.5 hover:bg-secondary rounded text-muted-foreground hover:text-foreground hidden sm:inline-flex" title="Share"><Share2 size={14} className="sm:w-4 sm:h-4" /></button>
+                                                                        </div>
+                                                                    )}
+                                                                </td>
+                                                            </tr>
+                                                        )
+                                                    })}
+                                                </tbody>
+                                            </table>
+                                        )}
+                                    </div>
+                                )
+                            ) : (
+                                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-4">
+                                    {filteredFiles.map((file, index) => {
+                                        const isSelected = selectedKeys.has(file.key);
+
+                                        return (
+                                            <div
+                                                key={file.key}
+                                                onClick={(e) => handleItemClick(file, e)}
+                                                onTouchStart={(e) => handleLongPressStart(file, e)}
+                                                onTouchEnd={(e) => {
+                                                    handleLongPressEnd();
+                                                    e.preventDefault();
+                                                    handleItemClick(file, e as any);
+                                                }}
+                                                onTouchMove={handleLongPressEnd}
+                                                onMouseDown={(e) => handleLongPressStart(file, e)}
+                                                onMouseUp={handleLongPressEnd}
+                                                onMouseLeave={handleLongPressEnd}
+                                                draggable={!isMobile}
+                                                onDragStart={(e) => handleDragStart(e, file)}
+                                                onDragOver={(e) => handleDragOver(e, file)}
+                                                onDragLeave={handleDragLeave}
+                                                onDrop={(e) => handleDrop(e, file)}
+                                                className={`
+                                 group relative border rounded-lg p-3 sm:p-4 flex flex-col items-center text-center transition-all cursor-pointer aspect-[1/1.1]
+                                 ${isSelected ? 'bg-blue-500/10 border-blue-500/50 shadow-md' : 'bg-card border-border hover:border-foreground/50 hover:shadow-lg'}
+                             `}
+                                            >
+                                                {selectionMode && (
+                                                    <div className={`absolute top-2 left-2 w-4 h-4 rounded border flex items-center justify-center transition-colors z-10 ${isSelected ? 'bg-blue-500 border-blue-500' : 'border-muted-foreground/30 bg-background'}`}>
+                                                        {isSelected && <Check size={10} className="text-white" />}
+                                                    </div>
+                                                )}
+
+                                                <div className="flex-1 flex items-center justify-center w-full overflow-hidden">
+                                                    {getIcon(file, 48, "w-12 h-12")}
+                                                </div>
+                                                <p className={`w-full mt-3 text-sm font-medium truncate px-1 ${isSelected ? 'text-blue-500 dark:text-blue-400' : 'text-foreground'}`}>{file.name}</p>
+                                            </div>
+                                        )
+                                    })}
+                                </div>
+                            )}
+                        </div>
+                    )
+                )}
+            </div>
+
+            {/* Floating Action Bar for Selection */}
+            {/* Floating Action Bar for Selection - Dynamic positioning */}
+            {selectedKeys.size > 0 && (
+                <div className="fixed left-1/2 -translate-x-1/2 bg-foreground text-background px-4 sm:px-6 py-2 sm:py-3 rounded-full shadow-2xl flex items-center gap-3 sm:gap-6 animate-in slide-in-from-bottom-4 z-50" style={{ bottom: 'max(1.5rem, env(safe-area-inset-bottom, 1.5rem))' }}>
+                    <span className="font-bold text-xs sm:text-sm">{selectedKeys.size} selected</span>
+                    <div className="h-4 w-px bg-background/20"></div>
+                    <div className="flex items-center gap-1 sm:gap-2">
+                        <button onClick={handleBulkDownload} className="p-1.5 sm:p-2 hover:bg-background/20 rounded-full transition-colors" title="Download Selected"><Download size={18} className="sm:w-5 sm:h-5" /></button>
+                        {!readOnly && <button onClick={openMoveModal} className="p-1.5 sm:p-2 hover:bg-background/20 rounded-full transition-colors hidden sm:inline-flex" title="Move Selected"><Move size={18} className="sm:w-5 sm:h-5" /></button>}
+                        {!readOnly && <button onClick={() => setDeleteConfirmation({ show: true, isBulk: true })} className="p-1.5 sm:p-2 hover:bg-red-500/20 hover:text-red-300 rounded-full transition-colors" title="Delete Selected"><Trash2 size={18} className="sm:w-5 sm:h-5" /></button>}
+                        <button onClick={() => setSelectedKeys(new Set())} className="p-1.5 sm:p-2 hover:bg-background/20 rounded-full transition-colors ml-1 sm:ml-2"><X size={18} className="sm:w-5 sm:h-5" /></button>
+                    </div>
+                </div>
+            )}
+
+            {/* Long-press Context Menu */}
+            {contextMenu.show && contextMenu.file && (
+                <>
+                    {/* Backdrop */}
+                    <div className="fixed inset-0 z-50" onClick={() => setContextMenu({ show: false, file: null, x: 0, y: 0 })} />
+
+                    {/* Context Menu */}
+                    <div
+                        className="fixed bg-card border border-border rounded-lg shadow-2xl py-2 z-50 min-w-[200px] animate-in fade-in zoom-in-95 duration-200"
+                        style={{
+                            left: `${Math.min(contextMenu.x, window.innerWidth - 220)}px`,
+                            top: `${Math.min(contextMenu.y, window.innerHeight - 300)}px`
+                        }}
+                    >
+                        <div className="px-3 py-2 border-b border-border">
+                            <div className="flex items-center gap-2">
+                                {getIcon(contextMenu.file, 16)}
+                                <span className="text-sm font-medium truncate max-w-[150px]">{contextMenu.file.name}</span>
+                            </div>
+                        </div>
+
+                        <button
+                            onClick={() => {
+                                if (contextMenu.file!.isFolder) {
+                                    handleNavigate(contextMenu.file!.key);
+                                } else {
+                                    handlePreview(contextMenu.file!);
+                                }
+                                setContextMenu({ show: false, file: null, x: 0, y: 0 });
+                            }}
+                            className="w-full px-3 py-2 text-left text-sm hover:bg-secondary flex items-center gap-2 transition-colors"
+                        >
+                            <Eye size={16} />
+                            {contextMenu.file.isFolder ? 'Open' : 'Preview'}
+                        </button>
+
+                        <button
+                            onClick={() => {
+                                handleDownload(contextMenu.file!);
+                                setContextMenu({ show: false, file: null, x: 0, y: 0 });
+                            }}
+                            className="w-full px-3 py-2 text-left text-sm hover:bg-secondary flex items-center gap-2 transition-colors"
+                        >
+                            <Download size={16} />
+                            Download
+                        </button>
+
+                        <button
+                            onClick={() => {
+                                openShareModal(contextMenu.file!);
+                                setContextMenu({ show: false, file: null, x: 0, y: 0 });
+                            }}
+                            className="w-full px-3 py-2 text-left text-sm hover:bg-secondary flex items-center gap-2 transition-colors"
+                        >
+                            <Share2 size={16} />
+                            Share
+                        </button>
+
+                        <button
+                            onClick={() => {
+                                handleCopyS3Path(contextMenu.file!);
+                                setContextMenu({ show: false, file: null, x: 0, y: 0 });
+                            }}
+                            className="w-full px-3 py-2 text-left text-sm hover:bg-secondary flex items-center gap-2 transition-colors"
+                        >
+                            <Link size={16} />
+                            Copy S3 URI
+                        </button>
+
+                        {!readOnly && (
+                            <>
+                                <div className="h-px bg-border my-1" />
+                                <button
+                                    onClick={() => {
+                                        openRenameModal(contextMenu.file!);
+                                        setContextMenu({ show: false, file: null, x: 0, y: 0 });
+                                    }}
+                                    className="w-full px-3 py-2 text-left text-sm hover:bg-secondary flex items-center gap-2 transition-colors"
+                                >
+                                    <Edit2 size={16} />
+                                    Rename
+                                </button>
+                                <button
+                                    onClick={() => {
+                                        const newSelected = new Set(selectedKeys);
+                                        newSelected.add(contextMenu.file!.key);
+                                        setSelectedKeys(newSelected);
+                                        setSelectionMode(true);
+                                        setContextMenu({ show: false, file: null, x: 0, y: 0 });
+                                    }}
+                                    className="w-full px-3 py-2 text-left text-sm hover:bg-secondary flex items-center gap-2 transition-colors"
+                                >
+                                    <CheckSquare size={16} />
+                                    Select
+                                </button>
+                            </>
+                        )}
+                    </div>
+                </>
+            )}
+
+
+
         </div>
     );
 };
