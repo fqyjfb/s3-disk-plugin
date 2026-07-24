@@ -48,16 +48,18 @@ export class S3Service {
   init(config: S3Config) {
     this.config = config;
     const normalizedEndpoint = this.normalizeEndpoint(config.endpoint);
+    const region = config.region || 'us-east-1';
     this.client = new S3Client({
-      region: config.region || 'us-east-1', // Fallback to us-east-1 if region is empty/undefined
+      region: region,
       endpoint: normalizedEndpoint || undefined,
       credentials: {
         accessKeyId: config.accessKeyId,
         secretAccessKey: config.secretAccessKey,
       },
-      forcePathStyle: true, // Needed for MinIO and compatible with others
-      // Explicitly disable TLS if connecting to localhost without https (common for MinIO)
+      forcePathStyle: true,
       tls: normalizedEndpoint?.includes('localhost') && normalizedEndpoint?.startsWith('http:') ? false : true,
+      signingRegion: region,
+      signingName: 's3',
     });
   }
 
