@@ -1,7 +1,7 @@
 {
   "id": "plugin-s3-disk",
   "name": "S3 云存储管理器",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "现代 S3 对象存储浏览器，支持 AWS S3、Cloudflare R2、MinIO 等，拖拽上传、文件预览、代码编辑、批量操作",
   "author": "ToolBox Team",
   "icon": "HardDrive",
