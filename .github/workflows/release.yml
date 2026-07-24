@@ -41,4 +41,5 @@ jobs:
             - Update plugin manifest
           draft: false
           prerelease: false
+          allowUpdates: true
           artifacts: 'plugin-s3-disk.zip'
