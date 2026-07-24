@@ -49,8 +49,8 @@ interface ExplorerProps {
 const getAwsErrorMessage = (err: any) => {
     if (!err) {
         return {
-            title: "Unknown Error",
-            message: "An unknown error occurred.",
+            title: "未知错误",
+            message: "发生未知错误。",
             details: "",
             docLink: ""
         };
@@ -556,7 +556,7 @@ const Explorer: React.FC<ExplorerProps> = ({ s3, bucketName, onUpload, onBackToB
                 const errInfo = getAwsErrorMessage(e);
                 setActionError({
                     show: true,
-                    title: "Folder Download Failed",
+                    title: "文件夹下载失败",
                     message: errInfo.message,
                     details: errInfo.details,
                     docLink: errInfo.docLink
@@ -593,7 +593,7 @@ const Explorer: React.FC<ExplorerProps> = ({ s3, bucketName, onUpload, onBackToB
         const path = `s3://${bucketName}/${file.key}`;
         try {
             await navigator.clipboard.writeText(path);
-            setNotification("S3 URI copied to clipboard");
+            setNotification("S3路径已复制到剪贴板");
         } catch (e) {
             console.error("Failed to copy", e);
         }
@@ -687,7 +687,7 @@ const Explorer: React.FC<ExplorerProps> = ({ s3, bucketName, onUpload, onBackToB
             const errInfo = getAwsErrorMessage(e);
             setActionError({
                 show: true,
-                title: "Failed to Create File",
+                title: "创建文件失败",
                 message: errInfo.message,
                 details: errInfo.details,
                 docLink: errInfo.docLink
@@ -771,7 +771,7 @@ const Explorer: React.FC<ExplorerProps> = ({ s3, bucketName, onUpload, onBackToB
             const errInfo = getAwsErrorMessage(e);
             setActionError({
                 show: true,
-                title: "Failed to Create Folder",
+                title: "创建文件夹失败",
                 message: errInfo.message,
                 details: errInfo.details,
                 docLink: errInfo.docLink
@@ -983,8 +983,8 @@ const Explorer: React.FC<ExplorerProps> = ({ s3, bucketName, onUpload, onBackToB
             const errInfo = getAwsErrorMessage(e);
             setActionError({
                 show: true,
-                title: "Share Failed",
-                message: "Could not generate public link.",
+                title: "分享失败",
+                message: "无法生成公共链接。",
                 details: errInfo.details,
                 docLink: errInfo.docLink
             });
@@ -1156,7 +1156,7 @@ const Explorer: React.FC<ExplorerProps> = ({ s3, bucketName, onUpload, onBackToB
                 {previewFile.file.mimeType?.startsWith('image') ? (
                     <ImagePreview
                         src={previewFile.url}
-                        alt="Preview"
+                        alt="预览"
                         onSwipeLeft={() => navigatePreview(1)}
                         onSwipeRight={() => navigatePreview(-1)}
                         onClose={closePreview}
@@ -1172,7 +1172,7 @@ const Explorer: React.FC<ExplorerProps> = ({ s3, bucketName, onUpload, onBackToB
                         <iframe
                             src={previewFile.url}
                             className="w-full h-full border-0 rounded-sm shadow-2xl"
-                            title="PDF Preview"
+                            title="PDF预览"
                         />
                     )
                 ) : previewFile.file.mimeType === 'application/epub+zip' || previewFile.file.name.endsWith('.epub') ? (
@@ -1297,7 +1297,7 @@ const Explorer: React.FC<ExplorerProps> = ({ s3, bucketName, onUpload, onBackToB
                     <BottomSheet
                         isOpen={moveModal.show}
                         onClose={() => setMoveModal({ ...moveModal, show: false })}
-                        title="Move Items"
+                        title="移动项目"
                         height="auto"
                     >
                         <div className="space-y-6 pb-4">
@@ -1420,10 +1420,10 @@ const Explorer: React.FC<ExplorerProps> = ({ s3, bucketName, onUpload, onBackToB
                                 />
                             </div>
                             <div className="flex-1 flex flex-col min-h-0">
-                                <label className="text-xs font-medium text-muted-foreground block mb-1.5">Content</label>
+                                <label className="text-xs font-medium text-muted-foreground block mb-1.5">内容</label>
                                 <textarea
                                     className="flex-1 w-full bg-background border border-input rounded-md p-4 text-sm font-mono text-foreground focus:border-foreground outline-none resize-none leading-relaxed"
-                                    placeholder="Type your content here..."
+                                    placeholder="在此输入内容..."
                                     value={createFileModal.content}
                                     onChange={(e) => setCreateFileModal({ ...createFileModal, content: e.target.value })}
                                     spellCheck={false}
@@ -1658,7 +1658,7 @@ const Explorer: React.FC<ExplorerProps> = ({ s3, bucketName, onUpload, onBackToB
                     <BottomSheet
                         isOpen={shareModal.show}
                         onClose={() => setShareModal({ show: false, file: null, url: null, duration: 3600 })}
-                        title="Share File"
+                        title="分享文件"
                         height="auto"
                     >
                         {!shareModal.url ? (
@@ -1692,7 +1692,7 @@ const Explorer: React.FC<ExplorerProps> = ({ s3, bucketName, onUpload, onBackToB
                                 <button
                                     onClick={() => {
                                         navigator.clipboard.writeText(shareModal.url!);
-                                        setNotification("Link copied to clipboard");
+                                        setNotification("链接已复制到剪贴板");
                                     }}
                                     className="w-full bg-foreground text-background py-3.5 rounded-xl text-base font-medium transition-colors flex items-center justify-center gap-2 shadow-sm active:scale-[0.98] transition-transform"
                                 >
@@ -1735,7 +1735,7 @@ const Explorer: React.FC<ExplorerProps> = ({ s3, bucketName, onUpload, onBackToB
                                     <button
                                         onClick={() => {
                                             navigator.clipboard.writeText(shareModal.url!);
-                                            setNotification("Link copied to clipboard");
+                                            setNotification("链接已复制到剪贴板");
                                         }}
                                         className="w-full bg-secondary hover:bg-secondary/80 text-foreground py-2 rounded-md text-sm font-medium transition-colors border border-border flex items-center justify-center gap-2"
                                     >
@@ -1797,10 +1797,10 @@ const Explorer: React.FC<ExplorerProps> = ({ s3, bucketName, onUpload, onBackToB
                                         <button onClick={() => setIsEditing(true)} className="px-3 py-1.5 bg-secondary text-foreground rounded text-xs font-medium flex items-center gap-2 hover:bg-secondary/80 border border-border"><Edit2 size={14} /> Edit</button>
                                     )
                                 )}
-                                <button onClick={() => setShowMetadata(!showMetadata)} className={`p-2 rounded transition-colors ${showMetadata ? 'bg-secondary text-foreground' : 'hover:bg-secondary text-muted-foreground hover:text-foreground'}`} title="Info"><Info size={18} /></button>
-                                <button onClick={() => openShareModal(previewFile.file)} className="p-2 rounded hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors" title="Share"><Share2 size={18} /></button>
-                                <button onClick={() => handleDownload(previewFile.file)} className="p-2 rounded hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors" title="Download"><Download size={18} /></button>
-                                <button onClick={closePreview} className="p-2 rounded hover:bg-destructive/10 text-muted-foreground hover:text-destructive transition-colors" title="Close"><X size={18} /></button>
+                                <button onClick={() => setShowMetadata(!showMetadata)} className={`p-2 rounded transition-colors ${showMetadata ? 'bg-secondary text-foreground' : 'hover:bg-secondary text-muted-foreground hover:text-foreground'}`} title="信息"><Info size={18} /></button>
+                                <button onClick={() => openShareModal(previewFile.file)} className="p-2 rounded hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors" title="分享"><Share2 size={18} /></button>
+                                <button onClick={() => handleDownload(previewFile.file)} className="p-2 rounded hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors" title="下载"><Download size={18} /></button>
+                                <button onClick={closePreview} className="p-2 rounded hover:bg-destructive/10 text-muted-foreground hover:text-destructive transition-colors" title="关闭"><X size={18} /></button>
                             </div>
                         </div>
 
@@ -1824,7 +1824,7 @@ const Explorer: React.FC<ExplorerProps> = ({ s3, bucketName, onUpload, onBackToB
                                         <div className="space-y-4">
                                             {/* Basic File Info */}
                                             <div className="space-y-2">
-                                                <h4 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">Properties</h4>
+                                                <h4 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">属性</h4>
                                                 <div className="space-y-2 text-sm">
                                                     <div className="flex justify-between py-1">
                                                         <span className="text-muted-foreground">Size:</span>
@@ -1860,7 +1860,7 @@ const Explorer: React.FC<ExplorerProps> = ({ s3, bucketName, onUpload, onBackToB
                                             {/* EXIF Data */}
                                             {exifData && (
                                                 <div className="space-y-2 pt-4 border-t border-border">
-                                                    <h4 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">EXIF Data</h4>
+                                                    <h4 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">EXIF数据</h4>
                                                     <div className="space-y-2 text-sm">
                                                         {exifData.Make && exifData.Model && (
                                                             <div className="flex justify-between py-1">
@@ -1931,7 +1931,7 @@ const Explorer: React.FC<ExplorerProps> = ({ s3, bucketName, onUpload, onBackToB
                                         <div className="space-y-6">
                                             {/* Basic File Info */}
                                             <div className="space-y-3">
-                                                <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Properties</h4>
+                                                <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">属性</h4>
                                                 <div className="space-y-3 text-sm">
                                                     <div className="flex flex-col gap-1">
                                                         <span className="text-muted-foreground text-xs">大小</span>
@@ -1945,7 +1945,7 @@ const Explorer: React.FC<ExplorerProps> = ({ s3, bucketName, onUpload, onBackToB
                                                     )}
                                                     {previewFile.file.mimeType && (
                                                         <div className="flex flex-col gap-1">
-                                                            <span className="text-muted-foreground text-xs">Type</span>
+                                                            <span className="text-muted-foreground text-xs">类型</span>
                                                             <span className="font-medium text-foreground break-all">{previewFile.file.mimeType}</span>
                                                         </div>
                                                     )}
@@ -1967,11 +1967,11 @@ const Explorer: React.FC<ExplorerProps> = ({ s3, bucketName, onUpload, onBackToB
                                             {/* EXIF Data */}
                                             {exifData && (
                                                 <div className="space-y-3 pt-6 border-t border-border">
-                                                    <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">EXIF Data</h4>
+                                                    <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">EXIF数据</h4>
                                                     <div className="space-y-3 text-sm">
                                                         {exifData.Make && exifData.Model && (
                                                             <div className="flex flex-col gap-1">
-                                                                <span className="text-muted-foreground text-xs">Camera</span>
+                                                                <span className="text-muted-foreground text-xs">相机</span>
                                                                 <span className="font-medium text-foreground">{exifData.Make} {exifData.Model}</span>
                                                             </div>
                                                         )}
@@ -1995,7 +1995,7 @@ const Explorer: React.FC<ExplorerProps> = ({ s3, bucketName, onUpload, onBackToB
                                                         )}
                                                         {exifData.FNumber && (
                                                             <div className="flex flex-col gap-1">
-                                                                <span className="text-muted-foreground text-xs">Aperture</span>
+                                                                <span className="text-muted-foreground text-xs">光圈</span>
                                                                 <span className="font-medium text-foreground">f/{exifData.FNumber}</span>
                                                             </div>
                                                         )}
@@ -2007,7 +2007,7 @@ const Explorer: React.FC<ExplorerProps> = ({ s3, bucketName, onUpload, onBackToB
                                                         )}
                                                         {exifData.FocalLength && (
                                                             <div className="flex flex-col gap-1">
-                                                                <span className="text-muted-foreground text-xs">Focal Length</span>
+                                                                <span className="text-muted-foreground text-xs">焦距</span>
                                                                 <span className="font-medium text-foreground">{exifData.FocalLength}mm</span>
                                                             </div>
                                                         )}
@@ -2153,14 +2153,14 @@ const Explorer: React.FC<ExplorerProps> = ({ s3, bucketName, onUpload, onBackToB
                             <button
                                 onClick={() => setCreateFolderModal({ show: true, folderName: '' })}
                                 className="p-2 text-muted-foreground hover:text-foreground hover:bg-secondary rounded-md transition-colors"
-                                title="New Folder"
+                                title="新建文件夹"
                             >
                                 <FolderPlus size={18} />
                             </button>
                             <button
                                 onClick={() => setCreateFileModal({ show: true, filename: '', content: '' })}
                                 className="p-2 text-muted-foreground hover:text-foreground hover:bg-secondary rounded-md transition-colors"
-                                title="New File"
+                                title="新建文件"
                             >
                                 <FilePlus size={18} />
                             </button>
@@ -2397,8 +2397,8 @@ const Explorer: React.FC<ExplorerProps> = ({ s3, bucketName, onUpload, onBackToB
                                                                 <td className="px-2 sm:px-4 py-3">
                                                                     {!selectionMode && (
                                                                         <div className="flex items-center justify-end gap-0.5 sm:gap-1 md:opacity-0 md:group-hover:opacity-100 transition-opacity">
-                                                                            <button onClick={(e) => { e.stopPropagation(); handleDownload(file) }} className="p-1 sm:p-1.5 hover:bg-secondary rounded text-muted-foreground hover:text-foreground" title="Download"><Download size={14} className="sm:w-4 sm:h-4" /></button>
-                                                                            <button onClick={(e) => { e.stopPropagation(); openShareModal(file) }} className="p-1 sm:p-1.5 hover:bg-secondary rounded text-muted-foreground hover:text-foreground hidden sm:inline-flex" title="Share"><Share2 size={14} className="sm:w-4 sm:h-4" /></button>
+                                                                            <button onClick={(e) => { e.stopPropagation(); handleDownload(file) }} className="p-1 sm:p-1.5 hover:bg-secondary rounded text-muted-foreground hover:text-foreground" title="下载"><Download size={14} className="sm:w-4 sm:h-4" /></button>
+                                                                            <button onClick={(e) => { e.stopPropagation(); openShareModal(file) }} className="p-1 sm:p-1.5 hover:bg-secondary rounded text-muted-foreground hover:text-foreground hidden sm:inline-flex" title="分享"><Share2 size={14} className="sm:w-4 sm:h-4" /></button>
                                                                         </div>
                                                                     )}
                                                                 </td>

@@ -16,6 +16,7 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import JSZip from 'jszip';
 import { S3Config, FileObject, BucketObject } from '../types';
 
+// Helper to format bytes
 export const formatBytes = (bytes: number, decimals = 2) => {
   if (!+bytes) return '0 Bytes';
   const k = 1024;
@@ -35,7 +36,7 @@ export class S3Service {
     }
   }
 
-  // 标准化 endpoint：确保包含协议头
+  // Normalize endpoint: ensure it has a protocol scheme
   private normalizeEndpoint(endpoint: string): string {
     if (!endpoint) return '';
     if (!endpoint.startsWith('http://') && !endpoint.startsWith('https://')) {
@@ -48,17 +49,19 @@ export class S3Service {
     this.config = config;
     const normalizedEndpoint = this.normalizeEndpoint(config.endpoint);
     this.client = new S3Client({
-      region: config.region || 'us-east-1',
+      region: config.region || 'us-east-1', // Fallback to us-east-1 if region is empty/undefined
       endpoint: normalizedEndpoint || undefined,
       credentials: {
         accessKeyId: config.accessKeyId,
         secretAccessKey: config.secretAccessKey,
       },
-      forcePathStyle: true,
+      forcePathStyle: true, // Needed for MinIO and compatible with others
+      // Explicitly disable TLS if connecting to localhost without https (common for MinIO)
       tls: normalizedEndpoint?.includes('localhost') && normalizedEndpoint?.startsWith('http:') ? false : true,
     });
   }
 
+  // Update config without re-instantiating client (useful for switching buckets)
   updateConfig(newConfig: Partial<S3Config>) {
     if (this.config) {
       this.config = { ...this.config, ...newConfig };
@@ -66,55 +69,58 @@ export class S3Service {
   }
 
   async listBuckets(): Promise<BucketObject[]> {
-    if (!this.client) throw new Error("S3 客户端未初始化");
+    if (!this.client) throw new Error("S3 Client not initialized");
+
     try {
       const command = new ListBucketsCommand({});
       const response = await this.client.send(command);
+
       return (response.Buckets || []).map(b => ({
         name: b.Name || 'Unknown',
         creationDate: b.CreationDate
       }));
     } catch (error) {
-      console.error("错误：列出存储桶失败", error);
+      console.error("Error listing buckets:", error);
       throw error;
     }
   }
 
   async createBucket(bucketName: string): Promise<void> {
-    if (!this.client) throw new Error("S3 客户端未初始化");
+    if (!this.client) throw new Error("S3 Client not initialized");
     try {
       const command = new CreateBucketCommand({
         Bucket: bucketName,
       });
       await this.client.send(command);
     } catch (error) {
-      console.error("错误：创建存储桶失败", error);
+      console.error("Error creating bucket:", error);
       throw error;
     }
   }
 
   async deleteBucket(bucketName: string): Promise<void> {
-    if (!this.client) throw new Error("S3 客户端未初始化");
+    if (!this.client) throw new Error("S3 Client not initialized");
     try {
       const command = new DeleteBucketCommand({
         Bucket: bucketName
       });
       await this.client.send(command);
     } catch (error) {
-      console.error("错误：删除存储桶失败", error);
+      console.error("Error deleting bucket:", error);
       throw error;
     }
   }
 
   async listFiles(prefix: string = ''): Promise<FileObject[]> {
-    if (!this.client || !this.config) throw new Error("S3 客户端未初始化");
-    if (!this.config.bucketName) throw new Error("未选择存储桶");
+    if (!this.client || !this.config) throw new Error("S3 Client not initialized");
+    if (!this.config.bucketName) throw new Error("No bucket selected");
 
     try {
       let isTruncated = true;
       let continuationToken: string | undefined = undefined;
       const allFiles: FileObject[] = [];
 
+      // Pagination loop to fetch all files in the current directory
       while (isTruncated) {
         const command: ListObjectsV2Command = new ListObjectsV2Command({
           Bucket: this.config.bucketName,
@@ -125,9 +131,11 @@ export class S3Service {
 
         const response = await this.client.send(command);
 
+        // Handle folders (CommonPrefixes)
         if (response.CommonPrefixes) {
           response.CommonPrefixes.forEach((p) => {
             if (p.Prefix) {
+              // Avoid duplicates if pagination returns them (rare for CommonPrefixes but good safety)
               const exists = allFiles.some(f => f.key === p.Prefix);
               if (!exists) {
                 allFiles.push({
@@ -142,9 +150,10 @@ export class S3Service {
           });
         }
 
+        // Handle files (Contents)
         if (response.Contents) {
           response.Contents.forEach((c) => {
-            if (c.Key && c.Key !== prefix) {
+            if (c.Key && c.Key !== prefix) { // Skip the folder object itself if it exists
               allFiles.push({
                 key: c.Key,
                 name: c.Key.replace(prefix, ''),
@@ -161,6 +170,7 @@ export class S3Service {
         continuationToken = response.NextContinuationToken;
       }
 
+      // Sort: Folders first, then files. Alphabetical.
       return allFiles.sort((a, b) => {
         if (a.isFolder === b.isFolder) {
           return a.name.localeCompare(b.name);
@@ -169,13 +179,14 @@ export class S3Service {
       });
 
     } catch (error) {
-      console.error("错误：列出文件失败", error);
+      console.error("Error listing files:", error);
       throw error;
     }
   }
 
+  // Helper: Recursively list all objects with a prefix (no delimiter)
   private async listAllObjects(prefix: string): Promise<{ Key: string; Size: number }[]> {
-    if (!this.client || !this.config?.bucketName) throw new Error("无效状态");
+    if (!this.client || !this.config?.bucketName) throw new Error("Invalid state");
 
     let isTruncated = true;
     let continuationToken: string | undefined = undefined;
@@ -204,12 +215,14 @@ export class S3Service {
   }
 
   async deleteFolder(prefix: string): Promise<void> {
-    if (!this.client || !this.config?.bucketName) throw new Error("无效状态");
+    if (!this.client || !this.config?.bucketName) throw new Error("Invalid state");
 
+    // 1. List all objects recursively
     const objects = await this.listAllObjects(prefix);
 
     if (objects.length === 0) return;
 
+    // 2. Delete in batches of 1000 (S3 limit)
     const batchSize = 1000;
     for (let i = 0; i < objects.length; i += batchSize) {
       const batch = objects.slice(i, i + batchSize);
@@ -224,11 +237,12 @@ export class S3Service {
     }
   }
 
+  // Calculate total size of a bucket (or prefix within bucket)
   async getBucketSize(bucketName?: string, prefix: string = ''): Promise<number> {
-    if (!this.client) throw new Error("S3 客户端未初始化");
+    if (!this.client) throw new Error("S3 Client not initialized");
 
     const targetBucket = bucketName || this.config?.bucketName;
-    if (!targetBucket) throw new Error("未指定存储桶");
+    if (!targetBucket) throw new Error("No bucket specified");
 
     try {
       let isTruncated = true;
@@ -256,19 +270,19 @@ export class S3Service {
 
       return totalSize;
     } catch (error) {
-      console.error(`错误：计算存储桶大小失败 ${targetBucket}`, error);
+      console.error(`Error calculating bucket size for ${targetBucket}:`, error);
       throw error;
     }
   }
 
   async downloadFolderAsZip(prefix: string): Promise<Blob> {
-    if (!this.client || !this.config?.bucketName) throw new Error("无效状态");
+    if (!this.client || !this.config?.bucketName) throw new Error("Invalid state");
 
     const zip = new JSZip();
     const objects = await this.listAllObjects(prefix);
 
     await Promise.all(objects.map(async (obj) => {
-      if (obj.Key.endsWith('/')) return;
+      if (obj.Key.endsWith('/')) return; // Skip folder markers
 
       try {
         const command = new GetObjectCommand({
@@ -278,8 +292,10 @@ export class S3Service {
 
         const response = await this.client!.send(command);
         if (response.Body) {
+          // transformToByteArray is available in v3 sdk browser client
           const byteArray = await response.Body.transformToByteArray();
 
+          // Calculate relative path
           const relativePath = obj.Key.startsWith(prefix)
             ? obj.Key.substring(prefix.length)
             : obj.Key;
@@ -287,7 +303,7 @@ export class S3Service {
           zip.file(relativePath, byteArray);
         }
       } catch (e) {
-        console.error(`下载文件 ${obj.Key} 到 ZIP 失败`, e);
+        console.error(`Failed to download ${obj.Key} for zip`, e);
       }
     }));
 
@@ -295,30 +311,35 @@ export class S3Service {
   }
 
   async downloadFilesAsZip(files: FileObject[]): Promise<Blob> {
-    if (!this.client || !this.config?.bucketName) throw new Error("无效状态");
+    if (!this.client || !this.config?.bucketName) throw new Error("Invalid state");
     const zip = new JSZip();
 
-    for (const f of files) {
+    // Limit concurrency slightly to avoid overwhelming network/browser
+    const downloadFile = async (file: FileObject) => {
       try {
         const command = new GetObjectCommand({
           Bucket: this.config!.bucketName,
-          Key: f.key
+          Key: file.key
         });
         const response = await this.client!.send(command);
         if (response.Body) {
           const byteArray = await response.Body.transformToByteArray();
-          zip.file(f.name, byteArray);
+          zip.file(file.name, byteArray);
         }
       } catch (e) {
-        console.error("压缩失败", f.key);
+        console.error("Failed to zip", file.key);
       }
+    };
+
+    for (const f of files) {
+      await downloadFile(f);
     }
 
     return await zip.generateAsync({ type: "blob" });
   }
 
-  async getPresignedUrl(key: string, options?: { download?: boolean; expiresIn?: number }): Promise<string> {
-    if (!this.client || !this.config || !this.config.bucketName) throw new Error("S3 客户端无效");
+  async getPresignedUrl(key: string, options?: { download?: boolean, expiresIn?: number }): Promise<string> {
+    if (!this.client || !this.config || !this.config.bucketName) throw new Error("S3 Client invalid");
 
     const commandInput: any = {
       Bucket: this.config.bucketName,
@@ -332,11 +353,12 @@ export class S3Service {
 
     const command = new GetObjectCommand(commandInput);
 
+    // Default 1 hour (3600)
     return getSignedUrl(this.client, command, { expiresIn: options?.expiresIn || 3600 });
   }
 
   async saveFileContent(key: string, content: string, mimeType: string = 'text/plain'): Promise<void> {
-    if (!this.client || !this.config || !this.config.bucketName) throw new Error("S3 客户端无效");
+    if (!this.client || !this.config || !this.config.bucketName) throw new Error("S3 Client invalid");
     const command = new PutObjectCommand({
       Bucket: this.config.bucketName,
       Key: key,
@@ -351,7 +373,7 @@ export class S3Service {
     prefix: string,
     onProgress?: (progress: number, loaded: number, total: number) => void
   ): Promise<void> {
-    if (!this.client || !this.config || !this.config.bucketName) throw new Error("S3 客户端无效");
+    if (!this.client || !this.config || !this.config.bucketName) throw new Error("S3 Client invalid");
 
     const key = `${prefix}${file.name}`;
 
@@ -375,7 +397,7 @@ export class S3Service {
 
       await upload.done();
     } catch (error: any) {
-      console.error("标准上传失败", error);
+      console.error("Standard upload failed:", error);
 
       const isMiddlewareError = error.message && (
         error.message.includes("middleware") ||
@@ -384,7 +406,7 @@ export class S3Service {
       );
 
       if (isMiddlewareError) {
-        console.warn("由于 SDK 中间件问题，回退到简单的 PutObjectCommand");
+        console.warn("Falling back to simple PutObjectCommand due to SDK middleware issue");
 
         const command = new PutObjectCommand({
           Bucket: this.config.bucketName,
@@ -403,52 +425,8 @@ export class S3Service {
     }
   }
 
-  async uploadFolder(files: FileList, prefix: string): Promise<void> {
-    if (!this.client || !this.config || !this.config.bucketName) throw new Error("S3 客户端无效");
-
-    const entries = Array.from(files);
-    await Promise.all(entries.map(async (file) => {
-      // webkitRelativePath contains the relative path within the folder
-      const relativePath = (file as any).webkitRelativePath || file.name;
-      const key = `${prefix}${relativePath}`;
-
-      try {
-        const upload = new Upload({
-          client: this.client,
-          params: {
-            Bucket: this.config.bucketName,
-            Key: key,
-            Body: file,
-            ContentType: file.type,
-          },
-        });
-
-        await upload.done();
-      } catch (error: any) {
-        console.error("上传文件失败", error);
-
-        const isMiddlewareError = error.message && (
-          error.message.includes("middleware") ||
-          error.message.includes("serializerMiddleware") ||
-          error.message.includes("is not a function")
-        );
-
-        if (isMiddlewareError) {
-          await this.client.send(new PutObjectCommand({
-            Bucket: this.config.bucketName,
-            Key: key,
-            Body: file,
-            ContentType: file.type,
-          }));
-        } else {
-          throw error;
-        }
-      }
-    }));
-  }
-
   async deleteFile(key: string): Promise<void> {
-    if (!this.client || !this.config || !this.config.bucketName) throw new Error("S3 客户端无效");
+    if (!this.client || !this.config || !this.config.bucketName) throw new Error("S3 Client invalid");
 
     const command = new DeleteObjectCommand({
       Bucket: this.config.bucketName,
@@ -459,7 +437,7 @@ export class S3Service {
   }
 
   async createFolder(folderName: string, prefix: string): Promise<void> {
-    if (!this.client || !this.config || !this.config.bucketName) throw new Error("S3 客户端无效");
+    if (!this.client || !this.config || !this.config.bucketName) throw new Error("S3 Client invalid");
 
     const sanitizedName = folderName.replace(/^\/+|\/+$/g, '');
     const key = `${prefix}${sanitizedName}/`;
@@ -474,8 +452,10 @@ export class S3Service {
   }
 
   async moveObject(sourceBucket: string, sourceKey: string, destBucket: string, destKey: string): Promise<void> {
-    if (!this.client) throw new Error("S3 客户端无效");
+    if (!this.client) throw new Error("S3 Client invalid");
 
+    // 1. Copy
+    // CopySource must be URL encoded (bucket/key).
     const copySource = `${sourceBucket}/${encodeURIComponent(sourceKey)}`;
 
     await this.client.send(new CopyObjectCommand({
@@ -484,30 +464,21 @@ export class S3Service {
       CopySource: copySource
     }));
 
+    // 2. Delete Original
     await this.client.send(new DeleteObjectCommand({
       Bucket: sourceBucket,
       Key: sourceKey
     }));
   }
 
-  async copyObject(sourceBucket: string, sourceKey: string, destBucket: string, destKey: string): Promise<void> {
-    if (!this.client) throw new Error("S3 客户端无效");
-
-    const copySource = `${sourceBucket}/${encodeURIComponent(sourceKey)}`;
-
-    await this.client.send(new CopyObjectCommand({
-      Bucket: destBucket,
-      Key: destKey,
-      CopySource: copySource
-    }));
-  }
-
   async moveFolder(sourceBucket: string, sourcePrefix: string, destBucket: string, destPrefix: string): Promise<void> {
-    if (!this.client) throw new Error("S3 客户端无效");
+    if (!this.client) throw new Error("S3 Client invalid");
 
+    // 1. List all objects in source folder
     const objects = await this.listAllObjects(sourcePrefix);
     if (objects.length === 0) return;
 
+    // 2. Move each object
     for (const obj of objects) {
       const relativePath = obj.Key.substring(sourcePrefix.length);
       const newKey = `${destPrefix}${relativePath}`;
