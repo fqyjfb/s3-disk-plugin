@@ -121,12 +121,13 @@ const Explorer: React.FC<ExplorerProps> = ({ s3, bucketName, onUpload, onBackToB
     const listRef = useRef<HTMLDivElement>(null);
 
     // Virtual scrolling
-    const ROW_HEIGHT = 56; // px per list row
+    const ROW_HEIGHT = 56;
     const virtualizer = useVirtualizer({
         count: filteredFiles.length,
         getScrollElement: () => listRef.current,
         estimateSize: () => ROW_HEIGHT,
-        overscan: 5
+        overscan: 5,
+        horizontal: false,
     });
 
     // Edge swipe for back navigation
