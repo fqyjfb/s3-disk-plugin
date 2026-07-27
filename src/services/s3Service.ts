@@ -37,10 +37,13 @@ export class S3Service {
       if (result.success) {
         return result.data;
       }
-      throw new Error(result.error || 'Unknown error');
+      const error = new Error(result.error || 'Unknown error');
+      error.name = result.name || 'Error';
+      error.code = result.code;
+      throw error;
     }
 
-    throw new Error('Electron S3 proxy not available');
+    throw new Error('Electron S3 代理不可用');
   }
 
   async createBucket(bucketName: string): Promise<void> {
@@ -49,12 +52,15 @@ export class S3Service {
     if (this.useElectronProxy) {
       const result = await (window as any).electron.s3.createBucket(this.config, bucketName);
       if (!result.success) {
-        throw new Error(result.error || 'Unknown error');
+        const error = new Error(result.error || 'Unknown error');
+        error.name = result.name || 'Error';
+        error.code = result.code;
+        throw error;
       }
       return;
     }
 
-    throw new Error('Electron S3 proxy not available');
+    throw new Error('Electron S3 代理不可用');
   }
 
   async deleteBucket(bucketName: string): Promise<void> {
@@ -63,12 +69,15 @@ export class S3Service {
     if (this.useElectronProxy) {
       const result = await (window as any).electron.s3.deleteBucket(this.config, bucketName);
       if (!result.success) {
-        throw new Error(result.error || 'Unknown error');
+        const error = new Error(result.error || 'Unknown error');
+        error.name = result.name || 'Error';
+        error.code = result.code;
+        throw error;
       }
       return;
     }
 
-    throw new Error('Electron S3 proxy not available');
+    throw new Error('Electron S3 代理不可用');
   }
 
   async listFiles(prefix: string = ''): Promise<FileObject[]> {
@@ -79,10 +88,13 @@ export class S3Service {
       if (result.success) {
         return result.data;
       }
-      throw new Error(result.error || 'Unknown error');
+      const error = new Error(result.error || 'Unknown error');
+      error.name = result.name || 'Error';
+      error.code = result.code;
+      throw error;
     }
 
-    throw new Error('Electron S3 proxy not available');
+    throw new Error('Electron S3 代理不可用');
   }
 
   private async listAllObjects(prefix: string): Promise<{ Key: string; Size: number }[]> {
@@ -93,10 +105,13 @@ export class S3Service {
       if (result.success) {
         return result.data;
       }
-      throw new Error(result.error || 'Unknown error');
+      const error = new Error(result.error || 'Unknown error');
+      error.name = result.name || 'Error';
+      error.code = result.code;
+      throw error;
     }
 
-    throw new Error('Electron S3 proxy not available');
+    throw new Error('Electron S3 代理不可用');
   }
 
   async deleteFolder(prefix: string): Promise<void> {
@@ -108,12 +123,15 @@ export class S3Service {
     if (this.useElectronProxy) {
       const result = await (window as any).electron.s3.deleteObjects(this.config, objects.map(o => o.Key));
       if (!result.success) {
-        throw new Error(result.error || 'Unknown error');
+        const error = new Error(result.error || 'Unknown error');
+        error.name = result.name || 'Error';
+        error.code = result.code;
+        throw error;
       }
       return;
     }
 
-    throw new Error('Electron S3 proxy not available');
+    throw new Error('Electron S3 代理不可用');
   }
 
   async getBucketSize(bucketName?: string, prefix: string = ''): Promise<number> {
@@ -127,10 +145,13 @@ export class S3Service {
       if (result.success) {
         return result.data.reduce((total: number, obj: { Size: number }) => total + (obj.Size || 0), 0);
       }
-      throw new Error(result.error || 'Unknown error');
+      const error = new Error(result.error || 'Unknown error');
+      error.name = result.name || 'Error';
+      error.code = result.code;
+      throw error;
     }
 
-    throw new Error('Electron S3 proxy not available');
+    throw new Error('Electron S3 代理不可用');
   }
 
   async downloadFolderAsZip(prefix: string): Promise<Blob> {
@@ -189,10 +210,13 @@ export class S3Service {
       if (result.success) {
         return result.data;
       }
-      throw new Error(result.error || 'Unknown error');
+      const error = new Error(result.error || 'Unknown error');
+      error.name = result.name || 'Error';
+      error.code = result.code;
+      throw error;
     }
 
-    throw new Error('Electron S3 proxy not available');
+    throw new Error('Electron S3 代理不可用');
   }
 
   async saveFileContent(key: string, content: string, mimeType: string = 'text/plain'): Promise<void> {
@@ -201,12 +225,15 @@ export class S3Service {
     if (this.useElectronProxy) {
       const result = await (window as any).electron.s3.putObject(this.config, key, content, mimeType);
       if (!result.success) {
-        throw new Error(result.error || 'Unknown error');
+        const error = new Error(result.error || 'Unknown error');
+        error.name = result.name || 'Error';
+        error.code = result.code;
+        throw error;
       }
       return;
     }
 
-    throw new Error('Electron S3 proxy not available');
+    throw new Error('Electron S3 代理不可用');
   }
 
   async uploadFile(
@@ -222,13 +249,16 @@ export class S3Service {
       const arrayBuffer = await file.arrayBuffer();
       const result = await (window as any).electron.s3.uploadFile(this.config, key, arrayBuffer, file.type);
       if (!result.success) {
-        throw new Error(result.error || 'Unknown error');
+        const error = new Error(result.error || 'Unknown error');
+        error.name = result.name || 'Error';
+        error.code = result.code;
+        throw error;
       }
       if (onProgress) onProgress(100, file.size, file.size);
       return;
     }
 
-    throw new Error('Electron S3 proxy not available');
+    throw new Error('Electron S3 代理不可用');
   }
 
   async deleteFile(key: string): Promise<void> {
@@ -237,12 +267,15 @@ export class S3Service {
     if (this.useElectronProxy) {
       const result = await (window as any).electron.s3.deleteObject(this.config, key);
       if (!result.success) {
-        throw new Error(result.error || 'Unknown error');
+        const error = new Error(result.error || 'Unknown error');
+        error.name = result.name || 'Error';
+        error.code = result.code;
+        throw error;
       }
       return;
     }
 
-    throw new Error('Electron S3 proxy not available');
+    throw new Error('Electron S3 代理不可用');
   }
 
   async createFolder(folderName: string, prefix: string): Promise<void> {
@@ -254,12 +287,15 @@ export class S3Service {
     if (this.useElectronProxy) {
       const result = await (window as any).electron.s3.putObject(this.config, key, '', '');
       if (!result.success) {
-        throw new Error(result.error || 'Unknown error');
+        const error = new Error(result.error || 'Unknown error');
+        error.name = result.name || 'Error';
+        error.code = result.code;
+        throw error;
       }
       return;
     }
 
-    throw new Error('Electron S3 proxy not available');
+    throw new Error('Electron S3 代理不可用');
   }
 
   async moveObject(sourceBucket: string, sourceKey: string, destBucket: string, destKey: string): Promise<void> {
@@ -268,17 +304,23 @@ export class S3Service {
     if (this.useElectronProxy) {
       const copyResult = await (window as any).electron.s3.copyObject(this.config, sourceKey, destKey);
       if (!copyResult.success) {
-        throw new Error(copyResult.error || 'Copy failed');
+        const error = new Error(copyResult.error || 'Copy failed');
+        error.name = copyResult.name || 'Error';
+        error.code = copyResult.code;
+        throw error;
       }
 
       const deleteResult = await (window as any).electron.s3.deleteObject(this.config, sourceKey);
       if (!deleteResult.success) {
-        throw new Error(deleteResult.error || 'Delete failed');
+        const error = new Error(deleteResult.error || 'Delete failed');
+        error.name = deleteResult.name || 'Error';
+        error.code = deleteResult.code;
+        throw error;
       }
       return;
     }
 
-    throw new Error('Electron S3 proxy not available');
+    throw new Error('Electron S3 代理不可用');
   }
 
   async moveFolder(sourceBucket: string, sourcePrefix: string, destBucket: string, destPrefix: string): Promise<void> {
@@ -305,9 +347,12 @@ export class S3Service {
           contentType: result.contentType || 'application/octet-stream'
         };
       }
-      throw new Error(result.error || 'Unknown error');
+      const error = new Error(result.error || 'Unknown error');
+      error.name = result.name || 'Error';
+      error.code = result.code;
+      throw error;
     }
 
-    throw new Error('Electron S3 proxy not available');
+    throw new Error('Electron S3 代理不可用');
   }
 }
